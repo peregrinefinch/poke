@@ -4,11 +4,10 @@ Poke is an ordinary Pooka package. Keep using `test "name" { ... }`,
 `test skip "name" { ... }` and `pooka test`. The compiler still discovers tests,
 isolates their output, reports failures and chooses the exit status.
 
-For a local project, declare Poke as a development dependency:
+Add Poke as a development dependency:
 
-```toml
-[dev-dependencies]
-poke = { path = "../poke" }
+```sh
+pooka add poke --dev
 ```
 
 ## Unit tests
@@ -339,8 +338,7 @@ implicit deadline; use scoped fixtures and `process.within` for bounded work.
 
 Poke targets Pooka 0.3.2 or later and Erlang/OTP 29. Its CI matrix runs
 unit, property, regression and snapshot checks on Linux, macOS and Windows, then
-checks formatting, documentation and publication archives. The current draft
-has been run locally on macOS; remote matrix results require pushing the library.
+checks formatting, documentation and publication archives.
 
 Line endings are significant in text snapshots. File APIs and IO requests use
 UTF-8; corpus loading accepts the native filename representations returned by

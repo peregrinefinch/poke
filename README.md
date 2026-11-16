@@ -18,11 +18,10 @@ test "a small sum" {
 }
 ```
 
-Add this draft as a development dependency:
+Add Poke as a development dependency:
 
-```toml
-[dev-dependencies]
-poke = { path = "../poke" }
+```sh
+pooka add poke --dev
 ```
 
 Run `pooka test`. Review snapshots with `pooka run -m poke review`.
