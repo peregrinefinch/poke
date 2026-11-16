@@ -195,3 +195,21 @@ test "concurrent counterexamples share one complete saved value" {
     should.equal(store.examples("shared", IntegerCodec()), Ok([7]))
   })
 }
+
+test "missing corpus trees are empty while a file at any ancestor is an error" {
+  fixture.with_directory(fn(directory) {
+    let missing = directory + "/not-created/yet"
+    should.equal(
+      corpus.Store(missing).examples("saved", IntegerCodec()),
+      Ok([])
+    )
+    should.equal(should.be_ok(file.exists(directory + "/not-created")), False)
+    should.be_ok(file.write(directory + "/blocked", "a file, not a directory"))
+    list.each(["/blocked", "/blocked/one", "/blocked/one/two"], fn(suffix) {
+      should.be_error(
+        corpus.Store(directory + suffix).examples("saved", IntegerCodec())
+      )
+      Nil
+    })
+  })
+}

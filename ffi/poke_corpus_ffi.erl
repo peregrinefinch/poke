@@ -10,11 +10,36 @@ load(Directory, Name) ->
     case property_directory(Directory, Name) of
         {error, _} = Error -> Error;
         {ok, Path} ->
-            case file:list_dir(Path) of
-                {error, enoent} -> {ok, []};
+            case directory_state(Path) of
+                missing -> {ok, []};
                 {error, Why} -> failure(Why);
-                {ok, Names} -> read_cases(Path, lists:sort(Names), [])
+                present ->
+                    case file:list_dir(Path) of
+                        {error, Why} -> failure(Why);
+                        {ok, Names} -> read_cases(Path, lists:sort(Names), [])
+                    end
             end
+    end.
+
+%% A missing final component is a new corpus. A file in the middle is a
+%% broken store. Windows can report enoent for both, so walk back to the first
+%% existing ancestor before deciding there are no saved examples to replay.
+%% An error after this check stays an error, including a directory disappearing
+%% while it is read; concurrent removal must not silently erase regression data.
+directory_state(Path) ->
+    case file:read_file_info(Path) of
+        {ok, #file_info{type = directory}} -> present;
+        {ok, _} -> {error, enotdir};
+        {error, enoent} ->
+            case filename:dirname(Path) of
+                Path -> {error, enoent};
+                Parent ->
+                    case directory_state(Parent) of
+                        {error, _} = Error -> Error;
+                        _ -> missing
+                    end
+            end;
+        {error, Why} -> {error, Why}
     end.
 
 read_cases(_, [], Acc) -> {ok, lists:reverse(Acc)};
