@@ -1,0 +1,645 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Find the changes before drawing a frame around them.
+////
+//// Small and medium documents use a bounded longest-common-subsequence table,
+//// so separated edits keep their shared lines. Above 40,000 table cells a linear
+//// prefix/suffix fallback avoids quadratic memory. Both views retain real line
+//// numbers. Final-newline changes are explicit, never phantom empty lines.
+module diff
+
+import pooka/int
+import pooka/list
+import pooka/string
+import poke/palette.{Mode}
+import poke/terminal
+
+enum Kind {
+  Context
+  Removed
+  Added
+  Gap
+  Ending
+}
+
+enum View {
+  Unified
+  Split
+}
+
+class Line(kind: Kind, old: Option(Int), fresh: Option(Int), text: String)
+
+class Comparison(lines: List(Line), added: Int, removed: Int, is_new: Bool)
+
+/// Analyse without formatting, useful to callers that want their own renderer.
+compare(before: Option(String), after: String) -> Comparison {
+  let old = match before {
+    None -> []
+    Some(text) -> _split(text)
+  }
+  let fresh = _split(after)
+  let lines = match list.length(old) * list.length(fresh) <= 40000 {
+    True -> _walk(
+      old,
+      fresh,
+      _rows(
+        list.reverse(old),
+        list.reverse(fresh),
+        [list.repeat(0, list.length(fresh) + 1)]
+      ),
+      0,
+      1,
+      1,
+      []
+    )
+    False -> _fallback(old, fresh)
+  }
+  let added = list.count(lines, fn(line: Line) { line.kind == Kind.Added })
+  let removed = list.count(lines, fn(line: Line) { line.kind == Kind.Removed })
+  let lines = match before {
+    Some(text) if string.ends_with(text, "\n") != string.ends_with(after, "\n") ->
+    list.concat(
+      lines,
+      [
+        Line(
+          Kind.Ending,
+          None,
+          None,
+          "Final newline: " + _ending(text) + " → " + _ending(after)
+        )
+      ]
+    )
+    _ -> lines
+  }
+  Comparison(lines, added, removed, before == None)
+}
+
+_split(text: String) -> List(String) {
+  match text {
+    "" -> []
+    _ -> {
+      let lines = string.split(text, "\n")
+      match string.ends_with(text, "\n") {
+        True -> list.take(lines, list.length(lines) - 1)
+        False -> lines
+      }
+    }
+  }
+}
+
+_ending(text: String) -> String {
+  match string.ends_with(text, "\n") {
+    True -> "present"
+    False -> "missing"
+  }
+}
+
+_rows(old: List(String), fresh: List(String), rows: List(List(Int))) -> List(
+  List(Int)
+) {
+  match old {
+    [] -> rows
+    [head, ..rest] -> {
+      let assert [below, .._remaining] = rows
+      let row = _length_row(head, fresh, list.reverse(below), 0, [0])
+      _rows(rest, fresh, list.prepend(rows, row))
+    }
+  }
+}
+
+_length_row(
+  old: String,
+  fresh: List(String),
+  below: List(Int),
+  right: Int,
+  kept: List(Int)
+) -> List(Int) {
+  match fresh {
+    [] -> kept
+    [head, ..rest] -> {
+      let assert [diagonal, down, ..tail] = below
+      let length = match old == head {
+        True -> diagonal + 1
+        False -> int.max(down, right)
+      }
+      _length_row(
+        old,
+        rest,
+        list.prepend(tail, down),
+        length,
+        list.prepend(kept, length)
+      )
+    }
+  }
+}
+
+_at(row: List(Int), index: Int) -> Int {
+  let assert [value, .._rest] = list.drop(row, index)
+  value
+}
+
+_walk(
+  old: List(String),
+  fresh: List(String),
+  rows: List(List(Int)),
+  column: Int,
+  old_number: Int,
+  new_number: Int,
+  kept: List(Line)
+) -> List(Line) {
+  match #(old, fresh) {
+    #([], []) -> list.reverse(kept)
+    #([], [head, ..rest]) -> _walk(
+      [],
+      rest,
+      rows,
+      column + 1,
+      old_number,
+      new_number + 1,
+      list.prepend(kept, Line(Kind.Added, None, Some(new_number), head))
+    )
+    #([head, ..rest], []) -> _walk(
+      rest,
+      [],
+      list.drop(rows, 1),
+      column,
+      old_number + 1,
+      new_number,
+      list.prepend(kept, Line(Kind.Removed, Some(old_number), None, head))
+    )
+    #([a, ..left], [b, ..right]) if a == b -> _walk(
+      left,
+      right,
+      list.drop(rows, 1),
+      column + 1,
+      old_number + 1,
+      new_number + 1,
+      list.prepend(
+        kept,
+        Line(Kind.Context, Some(old_number), Some(new_number), a)
+      )
+    )
+    #([a, ..left], [b, ..right]) -> {
+      let assert [row, below, .._tail] = rows
+      match _at(below, column) >= _at(row, column + 1) {
+        True -> _walk(
+          left,
+          fresh,
+          list.drop(rows, 1),
+          column,
+          old_number + 1,
+          new_number,
+          list.prepend(kept, Line(Kind.Removed, Some(old_number), None, a))
+        )
+        False -> _walk(
+          old,
+          right,
+          rows,
+          column + 1,
+          old_number,
+          new_number + 1,
+          list.prepend(kept, Line(Kind.Added, None, Some(new_number), b))
+        )
+      }
+    }
+  }
+}
+
+_prefix(old: List(String), fresh: List(String), kept: List(String)) -> #(
+  List(String),
+  List(String),
+  List(String)
+) {
+  match #(old, fresh) {
+    #([a, ..left], [b, ..right]) if a == b -> _prefix(
+      left,
+      right,
+      list.prepend(kept, a)
+    )
+    _ -> #(list.reverse(kept), old, fresh)
+  }
+}
+
+_fallback(old: List(String), fresh: List(String)) -> List(Line) {
+  let #(prefix, left, right) = _prefix(old, fresh, [])
+  let #(suffix, left, right) = _prefix(
+    list.reverse(left),
+    list.reverse(right),
+    []
+  )
+  let start = list.length(prefix) + 1
+  let context = list.index_map(prefix, fn(text: String, i: Int) {
+    Line(Kind.Context, Some(i + 1), Some(i + 1), text)
+  })
+  let removed = list.index_map(list.reverse(left), fn(text: String, i: Int) {
+    Line(Kind.Removed, Some(start + i), None, text)
+  })
+  let added = list.index_map(list.reverse(right), fn(text: String, i: Int) {
+    Line(Kind.Added, None, Some(start + i), text)
+  })
+  let removed_count = list.length(left)
+  let added_count = list.length(right)
+  let ending = list.index_map(list.reverse(suffix), fn(text: String, i: Int) {
+    Line(
+      Kind.Context,
+      Some(start + removed_count + i),
+      Some(start + added_count + i),
+      text
+    )
+  })
+  list.flatten([context, removed, added, ending])
+}
+
+/// Hide long unchanged runs, preserving three context lines beside each change.
+compact(lines: List(Line)) -> List(Line) {
+  _compact(lines, True, [])
+}
+
+_compact(lines: List(Line), first: Bool, kept: List(Line)) -> List(Line) {
+  match lines {
+    [] -> list.reverse(kept)
+    [head, ..rest] if head.kind != Kind.Context -> _compact(
+      rest,
+      False,
+      list.prepend(kept, head)
+    )
+    _ -> {
+      let #(context, rest) = list.split_while(lines, fn(line: Line) {
+        line.kind == Kind.Context
+      })
+      let length = list.length(context)
+      let visible = match #(first, rest == []) {
+        #(True, False) if length > 3 -> list.prepend(
+          list.drop(context, length - 3),
+          Line(
+            Kind.Gap,
+            None,
+            None,
+            int.to_string(length - 3) + " unchanged lines"
+          )
+        )
+        #(False, True) if length > 3 -> list.concat(
+          list.take(context, 3),
+          [
+            Line(
+              Kind.Gap,
+              None,
+              None,
+              int.to_string(length - 3) + " unchanged lines"
+            )
+          ]
+        )
+        _ if length > 6 -> list.flatten(
+          [
+            list.take(context, 3),
+            [
+              Line(
+                Kind.Gap,
+                None,
+                None,
+                int.to_string(length - 6) + " unchanged lines"
+              )
+            ],
+            list.drop(context, length - 3)
+          ]
+        )
+        _ -> context
+      }
+      _compact(
+        rest,
+        False,
+        list.fold(visible, kept, fn(acc: List(Line), line: Line) {
+          list.prepend(acc, line)
+        })
+      )
+    }
+  }
+}
+
+/// A single aligned gutter keeps each number beside its change marker.
+/// Removed rows use the old number; added and shared rows use the new one.
+render(before: Option(String), after: String, mode: Mode) -> String {
+  render_with(before, after, View.Unified, 76, mode)
+}
+
+/// Split rendering remains available to callers, but the interactive reviewer
+/// always uses the single-column layout.
+render_with(
+  before: Option(String),
+  after: String,
+  view: View,
+  width: Int,
+  mode: Mode
+) -> String {
+  match before {
+    Some(text) if text == after -> palette.muted("No changes.\n", mode)
+    _ -> {
+      let comparison = compare(before, after)
+      let width = int.max(16, width)
+      let rows = compact(comparison.lines)
+      match view == View.Split && width >= 96 {
+        True -> _split_header(width, mode) + _split_rows(rows, width, mode)
+          + "  " + palette.muted(
+          "╰" + string.repeat("─", width - 2) + "╯\n",
+          mode
+        )
+
+        False -> _birdie_panel(rows, width, mode)
+      }
+    }
+  }
+}
+
+/// Hiding the diff shows the complete candidate, rather than a blank panel.
+render_candidate(text: String, width: Int, mode: Mode) -> String {
+  let comparison = compare(None, text)
+  let lines = list.map(comparison.lines, fn(line: Line) {
+    Line(Kind.Context, None, line.fresh, line.text)
+  })
+  _birdie_panel(lines, int.max(16, width), mode)
+}
+
+_index(value: Option(Int)) -> Int {
+  match value {
+    None -> 0
+    Some(number) -> number
+  }
+}
+
+_birdie_panel(lines: List(Line), width: Int, mode: Mode) -> String {
+  let largest = list.fold(lines, 1, fn(largest: Int, line: Line) {
+    int.max(largest, int.max(_index(line.old), _index(line.fresh)))
+  })
+  let gutter = string.length(int.to_string(largest)) + 2
+  let body = match lines {
+    [] -> _birdie_line(
+      Line(Kind.Gap, None, None, "Empty snapshot"),
+      gutter,
+      width,
+      mode
+    )
+    _ -> list.map(lines, fn(line: Line) {
+      _birdie_line(line, gutter, width, mode)
+    }) |> string.join("")
+  }
+  "  " + palette.heading(
+    string.repeat("─", gutter) + "┬" + string.repeat("─", width - gutter - 1) + "\n",
+    mode
+  )
+    + body
+    + "  " + palette.heading(
+    string.repeat("─", gutter) + "┴" + string.repeat("─", width - gutter - 1) + "\n",
+    mode
+  )
+}
+
+_birdie_line(line: Line, gutter: Int, width: Int, mode: Mode) -> String {
+  let number = match line.kind {
+    Kind.Removed -> int.to_string(_index(line.old))
+    Kind.Added -> int.to_string(_index(line.fresh))
+    Kind.Context -> int.to_string(_index(line.fresh))
+    _ -> ""
+  }
+  let padding = string.repeat(
+    " ",
+    int.max(0, gutter - 1 - string.length(number))
+  )
+  let number = padding + number
+  let marker = match line.kind {
+    Kind.Removed -> " - "
+    Kind.Added -> " + "
+    _ -> " │ "
+  }
+  let text = match line.kind {
+    Kind.Gap -> "⋯ " + line.text
+    Kind.Ending -> "↵ " + line.text
+    _ -> line.text
+  }
+  // Wrap visible grapheme clusters, not UTF-8 bytes. A continuation belongs
+  // to the same source line, so it gets an arrow rather than another number.
+  terminal.wrap(terminal.safe(text), width - gutter - 2)
+  |> list.index_map(fn(part, index) {
+    let prefix = match index == 0 {
+      True -> number + marker
+      False -> string.repeat(" ", gutter - 1) + " ↪ "
+    }
+    let row = prefix + part + "\n"
+    "  " + match line.kind {
+      Kind.Removed -> palette.diff_removed(row, mode)
+      Kind.Added -> palette.diff_added(row, mode)
+      _ -> palette.muted(row, mode)
+    }
+  }) |> string.join("")
+}
+
+_split_header(width: Int, mode: Mode) -> String {
+  let assert Ok(left) = int.divide(width - 3, 2)
+  let right = width - 3 - left
+  "  " + palette.muted(
+    "╭" + string.repeat("─", left) + "┬" + string.repeat("─", right) + "╮\n",
+    mode
+  )
+    + "  " + palette.muted("│", mode) + palette.heading(
+    terminal.fit("  ACCEPTED", left),
+    mode
+  ) + palette.muted("│", mode) + palette.added(
+    terminal.fit("  CANDIDATE", right),
+    mode
+  ) + palette.muted("│\n", mode)
+    + "  " + palette.muted(
+    "├" + string.repeat("─", left) + "┼" + string.repeat("─", right) + "┤\n",
+    mode
+  )
+}
+
+_number(value: Option(Int)) -> String {
+  match value {
+    None -> "    "
+    Some(number) -> {
+      let text = int.to_string(number)
+      string.repeat(" ", int.max(0, 4 - string.length(text))) + text
+    }
+  }
+}
+
+_row(text: String, width: Int, kind: Kind, mode: Mode) -> String {
+  let fitted = terminal.fit(text, width - 2)
+  let content = match kind {
+    Kind.Added -> palette.diff_added(fitted, mode)
+    Kind.Removed -> palette.diff_removed(fitted, mode)
+    Kind.Context -> fitted
+    _ -> palette.muted(fitted, mode)
+  }
+  "  " + palette.muted("│", mode) + content + palette.muted("│\n", mode)
+}
+
+// Align removed/added runs within one hunk, leaving blank cells for insertions.
+_split_rows(lines: List(Line), width: Int, mode: Mode) -> String {
+  let assert Ok(left_width) = int.divide(width - 3, 2)
+  let right_width = width - 3 - left_width
+  _split_loop(lines, left_width, right_width, mode, []) |> list.reverse() |> string.join(
+    ""
+  )
+}
+
+_split_loop(
+  lines: List(Line),
+  left_width: Int,
+  right_width: Int,
+  mode: Mode,
+  kept: List(String)
+) -> List(String) {
+  match lines {
+    [] -> kept
+    [line, ..rest] if line.kind == Kind.Context -> _split_loop(
+      rest,
+      left_width,
+      right_width,
+      mode,
+      list.prepend(
+        kept,
+        _pair(Some(line), Some(line), left_width, right_width, mode)
+      )
+    )
+    [line, ..rest] if line.kind == Kind.Gap || line.kind == Kind.Ending -> {
+      let text = _row(
+        "  ⋯ " + line.text,
+        left_width + right_width + 3,
+        line.kind,
+        mode
+      )
+      _split_loop(rest, left_width, right_width, mode, list.prepend(kept, text))
+    }
+    _ -> {
+      let #(changed, rest) = list.split_while(lines, fn(line: Line) {
+        line.kind == Kind.Removed || line.kind == Kind.Added
+      })
+      let removed = list.filter(changed, fn(line: Line) {
+        line.kind == Kind.Removed
+      })
+      let added = list.filter(changed, fn(line: Line) {
+        line.kind == Kind.Added
+      })
+      let rendered = _pairs(removed, added, left_width, right_width, mode, [])
+      _split_loop(
+        rest,
+        left_width,
+        right_width,
+        mode,
+        list.concat(rendered, kept)
+      )
+    }
+  }
+}
+
+_pairs(
+  old: List(Line),
+  fresh: List(Line),
+  left: Int,
+  right: Int,
+  mode: Mode,
+  kept: List(String)
+) -> List(String) {
+  match #(old, fresh) {
+    #([], []) -> kept
+    #([a, ..rest], []) -> _pairs(
+      rest,
+      [],
+      left,
+      right,
+      mode,
+      list.prepend(kept, _pair(Some(a), None, left, right, mode))
+    )
+    #([], [b, ..rest]) -> _pairs(
+      [],
+      rest,
+      left,
+      right,
+      mode,
+      list.prepend(kept, _pair(None, Some(b), left, right, mode))
+    )
+    #([a, ..left_rest], [b, ..right_rest]) -> _pairs(
+      left_rest,
+      right_rest,
+      left,
+      right,
+      mode,
+      list.prepend(kept, _pair(Some(a), Some(b), left, right, mode))
+    )
+  }
+}
+
+_pair(old: Option(Line), fresh: Option(Line), left: Int, right: Int, mode: Mode) -> String {
+  "  " + palette.muted("│", mode) + _cell(old, True, fresh, left, mode) + palette.muted(
+    "│",
+    mode
+  ) + _cell(fresh, False, old, right, mode) + palette.muted("│\n", mode)
+}
+
+_cell(
+  value: Option(Line),
+  old: Bool,
+  peer: Option(Line),
+  width: Int,
+  mode: Mode
+) -> String {
+  match value {
+    None -> string.repeat(" ", width)
+    Some(line) -> {
+      let number = match old {
+        True -> line.old
+        False -> line.fresh
+      }
+      let marker = match line.kind {
+        Kind.Removed -> "− "
+        Kind.Added -> "+ "
+        _ -> "  "
+      }
+      let prefix = _number(number) + " " + marker
+      let available = width - terminal.cells(prefix) - 1
+      let text = terminal.fit(terminal.safe(line.text), available)
+      let content = match #(line.kind, peer) {
+        #(Kind.Removed, Some(other)) -> palette.diff_removed(
+          _highlight(
+            text,
+            terminal.fit(terminal.safe(other.text), available),
+            False,
+            mode
+          ),
+          mode
+        )
+        #(Kind.Added, Some(other)) -> palette.diff_added(
+          _highlight(
+            text,
+            terminal.fit(terminal.safe(other.text), available),
+            True,
+            mode
+          ),
+          mode
+        )
+        #(Kind.Removed, _) -> palette.diff_removed(text, mode)
+        #(Kind.Added, _) -> palette.diff_added(text, mode)
+        _ -> text
+      }
+      palette.muted(_number(number) + " ", mode) + marker + content + " "
+    }
+  }
+}
+
+_highlight(value: String, peer: String, addition: Bool, mode: Mode) -> String {
+  let #(prefix, changed, other) = _prefix(
+    string.split(value, ""),
+    string.split(peer, ""),
+    []
+  )
+  let #(suffix, changed, _remaining) = _prefix(
+    list.reverse(changed),
+    list.reverse(other),
+    []
+  )
+  string.join(prefix, "") + palette.focus(
+    string.join(list.reverse(changed), ""),
+    addition,
+    mode
+  ) + string.join(list.reverse(suffix), "")
+}

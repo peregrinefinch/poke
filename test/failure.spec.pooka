@@ -1,0 +1,80 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// A failed check should keep its meaning when it becomes data.
+module failure_test
+
+import poke/should
+import poke/failure
+import poke/pretty
+import pooka/list
+import pooka/string
+
+external Probe from erlang "poke_probe" {
+  fail() -> Nil
+}
+
+test "structured comparisons keep complete expected and actual text" {
+  let problem = failure.capture(fn() { should.equal([1, 2], [3, 4]) }) |> should.be_error()
+  should.equal(problem.kind, failure.Kind.Comparison)
+  should.equal(problem.expected, Some("[3, 4]"))
+  should.equal(problem.actual, Some("[1, 2]"))
+  should.equal(failure.compare(1, 1, "small sum"), Ok(Nil))
+  let custom = failure.compare(1, 2, "small sum") |> should.be_error()
+  should.equal(custom.message, "small sum")
+  should.contain_text(failure.describe(custom), "expected 2")
+}
+
+test "unwrapping and collection checks keep the offending value" {
+  let checks = [
+    fn() {
+      let _ = should.be_ok(Error("no"))
+      Nil
+    },
+    fn() {
+      let _ = should.be_error(Ok(42))
+      Nil
+    },
+    fn() {
+      let _ = should.be_some(None)
+      Nil
+    },
+    fn() { should.be_none(Some(42)) },
+    fn() { should.contain([1, 2], 3) },
+    fn() { should.contain_text("owl", "cat") },
+    fn() { should.be_close(1.0, 2.0, 0.01) },
+    fn() { should.not_equal(1, 1) },
+    fn() { should.be_true(False) },
+    fn() { should.be_false(True) }
+  ]
+  list.each(checks, fn(check) {
+    let problem = failure.capture(check) |> should.be_error()
+    should.equal(problem.kind, failure.Kind.Comparison)
+    should.be_some(problem.expected)
+    should.be_some(problem.actual)
+    Nil
+  })
+}
+
+test "plain assertions panics and foreign failures keep different categories" {
+  should.equal(failure.capture(fn() { 42 }), Ok(42))
+  let assertion = failure.capture(fn() { should.fail("a deliberate stop") }) |> should.be_error()
+  should.equal(assertion.kind, failure.Kind.Assertion)
+  should.equal(assertion.message, "a deliberate stop")
+  should.equal(assertion.expected, None)
+  let panic_value = failure.capture(fn() { panic as "kettle" }) |> should.be_error()
+  should.equal(panic_value.kind, failure.Kind.Panic)
+  should.equal(panic_value.message, "kettle")
+  let foreign = failure.capture(fn() { Probe.fail() }) |> should.be_error()
+  should.equal(foreign.kind, failure.Kind.Exception)
+  should.contain_text(foreign.message, "foreign_failure")
+}
+
+test "assertion reports use the snapshot formatter without truncating" {
+  let large = list.range(1, 51)
+  let problem = failure.capture(fn() {
+    should.equal_named([], large, "all the numbers")
+  }) |> should.be_error()
+  should.equal(problem.expected, Some(pretty.format(large)))
+  should.contain_text(failure.describe(problem), "50")
+  should.equal(string.contains(failure.describe(problem), "\u{1b}"), False)
+}

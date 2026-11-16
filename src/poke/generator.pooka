@@ -1,0 +1,296 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Generate a little trouble, then make it smaller.
+////
+//// Generators carry their seed explicitly. Sampling never changes global random
+//// state, so a failure can be replayed even when Pooka runs tests in parallel.
+//// The Generator interface is open: applications may supply their own samples
+//// and shrinking rules. This is test data, not cryptographic randomness.
+module generator
+
+import pooka/int
+import pooka/list
+import pooka/string
+
+/// A generated value and the seed for the next draw.
+class Sample(value: a, seed: Int)
+
+/// Supply deterministic samples and finite, preferably smaller candidates.
+/// Shrinkers must preserve the generator's domain. Property checking bounds the
+/// number of attempts and remembers visited candidates, even for custom rules.
+interface Generator(a) {
+  sample(seed: Int, size: Int) -> Sample(a)
+
+  shrink(value: a) -> List(a)
+}
+
+/// Advance a Park–Miller stream. Negative and zero seeds are normalised too.
+next_seed(seed: Int) -> Int {
+  let residue = seed % 2147483647
+  let positive = match residue < 0 {
+    True -> residue + 2147483647
+    False -> residue
+  }
+  let normal = match positive == 0 {
+    True -> 1
+    False -> positive
+  }
+  (
+    normal * 48271
+  ) % 2147483647
+}
+
+/// Integers within inclusive bounds, with extra visits to zero and endpoints.
+///
+/// ```pooka
+/// let sample = generator.integers(-10, 10).sample(42, 20)
+/// assert sample.value >= -10 && sample.value <= 10
+/// ```
+integers(minimum: Int, maximum: Int) -> Generator(Int) {
+  match minimum > maximum {
+    True -> panic as "generator.integers requires minimum <= maximum"
+    False -> _Integers(minimum, maximum)
+  }
+}
+
+class _Integers(minimum: Int, maximum: Int) with Generator(Int) {
+  sample(seed: Int, size: Int) -> Sample(Int) {
+    let seed = next_seed(seed)
+    match seed % 8 {
+      0 -> Sample(minimum, seed)
+      1 -> Sample(maximum, seed)
+      2 if minimum <= 0 && maximum >= 0 -> Sample(0, seed)
+      _ -> {
+        let #(offset, after) = _draw(
+          seed,
+          maximum - minimum + 1,
+          seed - 1,
+          2147483646
+        )
+        Sample(minimum + offset, after)
+      }
+    }
+  }
+
+  shrink(value: Int) -> List(Int) {
+    let target = int.max(minimum, int.min(maximum, 0))
+    match value == target || value < minimum || value > maximum {
+      True -> []
+      False -> {
+        let assert Ok(distance) = int.divide(value - target, 2)
+        list.prepend(_towards(value, distance), target)
+      }
+    }
+  }
+}
+
+// Draw enough base-2147483646 digits to reach wide BEAM integer ranges too.
+// The endpoint/zero bias above is intentional; this is not a uniform sampler.
+_draw(seed: Int, span: Int, value: Int, capacity: Int) -> #(Int, Int) {
+  match capacity >= span {
+    True -> #(value % span, seed)
+    False -> {
+      let after = next_seed(seed)
+      _draw(after, span, value * 2147483646 + after - 1, capacity * 2147483646)
+    }
+  }
+}
+
+_towards(value: Int, distance: Int) -> List(Int) {
+  match distance == 0 {
+    True -> []
+    False -> {
+      let assert Ok(half) = int.divide(distance, 2)
+      list.prepend(_towards(value, half), value - distance)
+    }
+  }
+}
+
+/// Both truth values, shrinking True towards False.
+booleans() -> Generator(Bool) {
+  _Booleans()
+}
+
+class _Booleans with Generator(Bool) {
+  sample(seed: Int, size: Int) -> Sample(Bool) {
+    let seed = next_seed(seed)
+    Sample(seed % 2 == 0, seed)
+  }
+
+  shrink(value: Bool) -> List(Bool) {
+    match value {
+      True -> [False]
+      False -> []
+    }
+  }
+}
+
+/// Pick from a nonempty list. Shrinking tries earlier choices.
+elements(values: List(a)) -> Generator(a) {
+  match values {
+    [] -> panic as "generator.elements requires at least one value"
+    _ -> _Elements(values)
+  }
+}
+
+class _Elements(values: List(a)) with Generator(a) {
+  sample(seed: Int, size: Int) -> Sample(a) {
+    let seed = next_seed(seed)
+    let assert Some(value) = list.at(values, seed % list.length(values))
+    Sample(value, seed)
+  }
+
+  shrink(value: a) -> List(a) {
+    let #(earlier, _) = list.split_while(values, fn(item: a) { item != value })
+    earlier
+  }
+}
+
+/// Always produce one value. There is nothing smaller to try.
+constant(value: a) -> Generator(a) {
+  _Constant(value)
+}
+
+class _Constant(value: a) with Generator(a) {
+  sample(seed: Int, size: Int) -> Sample(a) {
+    Sample(value, next_seed(seed))
+  }
+
+  shrink(value: a) -> List(a) {
+    []
+  }
+}
+
+/// Lists from length zero to min(maximum, size). Nested sampling reduces size.
+/// Shrinking tries shorter lists, then smaller individual elements.
+list_of(element: Generator(a), maximum: Int) -> Generator(List(a)) {
+  match maximum < 0 {
+    True -> panic as "generator.list_of requires a nonnegative maximum"
+    False -> _Lists(element, maximum)
+  }
+}
+
+class _Lists(element: Generator(a), maximum: Int) with Generator(List(a)) {
+  sample(seed: Int, size: Int) -> Sample(List(a)) {
+    let length = _Integers(0, int.max(0, int.min(maximum, size))).sample(
+      seed,
+      size
+    )
+    _sample_items(element, length.value, length.seed, int.max(0, size - 1), [])
+  }
+
+  shrink(values: List(a)) -> List(List(a)) {
+    match values {
+      [] -> []
+      _ -> {
+        let assert Ok(half) = int.divide(list.length(values), 2)
+        list.concat(
+          [[], list.take(values, half), list.drop(values, half)],
+          _shrink_items(values, element, [])
+        )
+      }
+    }
+  }
+}
+
+_sample_items(
+  element: Generator(a),
+  count: Int,
+  seed: Int,
+  size: Int,
+  acc: List(a)
+) -> Sample(List(a)) {
+  match count <= 0 {
+    True -> Sample(list.reverse(acc), seed)
+    False -> {
+      let generated = element.sample(seed, size)
+      _sample_items(
+        element,
+        count - 1,
+        generated.seed,
+        size,
+        list.prepend(acc, generated.value)
+      )
+    }
+  }
+}
+
+_shrink_items(values: List(a), element: Generator(a), prefix: List(a)) -> List(
+  List(a)
+) {
+  match values {
+    [] -> []
+    [head, ..tail] -> {
+      let here = list.map(element.shrink(head), fn(smaller: a) {
+        list.concat(list.reverse(prefix), list.prepend(tail, smaller))
+      })
+      list.concat(
+        here,
+        _shrink_items(tail, element, list.prepend(prefix, head))
+      )
+    }
+  }
+}
+
+/// Draw both halves from the same deterministic stream; shrink either half.
+pair(left: Generator(a), right: Generator(b)) -> Generator(#(a, b)) {
+  _Pair(left, right)
+}
+
+class _Pair(left: Generator(a), right: Generator(b)) with Generator(#(a, b)) {
+  sample(seed: Int, size: Int) -> Sample(#(a, b)) {
+    let first = left.sample(seed, size)
+    let second = right.sample(first.seed, size)
+    Sample(#(first.value, second.value), second.seed)
+  }
+
+  shrink(value: #(a, b)) -> List(#(a, b)) {
+    let #(a, b) = value
+    list.concat(
+      list.map(left.shrink(a), fn(smaller: a) { #(smaller, b) }),
+      list.map(right.shrink(b), fn(smaller: b) { #(a, smaller) })
+    )
+  }
+}
+
+/// Transform a generator. Arbitrary transforms have no inverse, so mapped
+/// generators deliberately do not shrink. Implement Generator for domain rules.
+map(source: Generator(a), transform: fn(a) -> b) -> Generator(b) {
+  _Mapped(source, transform)
+}
+
+class _Mapped(source: Generator(a), transform: fn(a) -> b) with Generator(b) {
+  sample(seed: Int, size: Int) -> Sample(b) {
+    let generated = source.sample(seed, size)
+    Sample(transform(generated.value), generated.seed)
+  }
+
+  shrink(value: b) -> List(b) {
+    []
+  }
+}
+
+/// Strings made from a nonempty alphabet of String fragments. Empty fragments
+/// are allowed. Strings shrink to empty because fragments may span code points.
+strings(alphabet: List(String), maximum: Int) -> Generator(String) {
+  match maximum < 0 {
+    True -> panic as "generator.strings requires a nonnegative maximum"
+    False -> _Strings(list_of(elements(alphabet), maximum))
+  }
+}
+
+class _Strings(source: Generator(List(String))) with Generator(String) {
+  sample(seed: Int, size: Int) -> Sample(String) {
+    let generated = source.sample(seed, size)
+    Sample(string.join(generated.value, ""), generated.seed)
+  }
+
+  // Fragments may contain several code points. Removing text is always a valid
+  // shrink only for single-code-point alphabets, so strings shrink to empty.
+  shrink(value: String) -> List(String) {
+    match value {
+      "" -> []
+      _ -> [""]
+    }
+  }
+}

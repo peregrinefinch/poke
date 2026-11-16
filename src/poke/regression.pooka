@@ -1,0 +1,24 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// A bug already met should not need a second introduction.
+////
+//// Keep small, named input/output examples beside the issue they protect. The
+//// first failed case raises a structured comparison in the ordinary test runner.
+module regression
+
+import poke/should
+import pooka/list
+
+class Case(name: String, input: a, expected: b)
+
+/// Run named examples through one function. Each input is evaluated once.
+///
+/// ```pooka
+/// regression.check([regression.Case("issue-12", 2, 4)], fn(n) { n * 2 })
+/// ```
+check(cases: List(Case(a, b)), run: fn(a) -> b) -> Nil {
+  list.each(cases, fn(example: Case(a, b)) {
+    let actual = run(example.input)
+    should.equal_named(actual, example.expected, "regression: " + example.name)
+  })
+}

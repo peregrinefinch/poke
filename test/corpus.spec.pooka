@@ -1,0 +1,197 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Once found, a counterexample should not need another lucky draw.
+module corpus_test
+
+import poke/should
+import poke/corpus
+import poke/fixture
+import poke/generator.{Generator, Sample}
+import poke/property
+import poke/process
+import pooka/file
+import pooka/int
+import pooka/list
+
+class IntegerCodec with corpus.Codec(Int) {
+  encode(value: Int) -> String {
+    int.to_string(value)
+  }
+
+  decode(text: String) -> Result(Int, String) {
+    match int.parse(text) {
+      Ok(value) -> Ok(value)
+      Error(_) -> Error("expected a saved integer")
+    }
+  }
+}
+
+class Shrinkable with Generator(Int) {
+  sample(seed: Int, size: Int) -> Sample(Int) {
+    Sample(100, seed)
+  }
+
+  shrink(value: Int) -> List(Int) {
+    match value > 1 {
+      True -> [0, 1]
+      False -> []
+    }
+  }
+}
+
+class MustNotDraw with Generator(Int) {
+  sample(seed: Int, size: Int) -> Sample(Int) {
+    panic as "corpus must run first"
+  }
+
+  shrink(value: Int) -> List(Int) {
+    []
+  }
+}
+
+test "a newly minimized counterexample is persisted and decoded" {
+  fixture.with_directory(fn(directory) {
+    let store = corpus.Store(directory)
+    let problem = store.check(
+      "positive-v1",
+      Shrinkable(),
+      IntegerCodec(),
+      fn(n) { n <= 0 },
+      property.defaults()
+    ) |> should.be_error()
+    should.equal(problem.value, Some(1))
+    should.be_some(problem.generated)
+    should.equal(
+      store.examples("positive-v1", IntegerCodec()) |> should.be_ok(),
+      [1]
+    )
+    let _ = store.check(
+      "positive-v1",
+      generator.constant(55),
+      IntegerCodec(),
+      fn(n) { n != 55 },
+      property.defaults()
+    ) |> should.be_error()
+    should.equal(
+      store.examples("positive-v1", IntegerCodec()) |> should.be_ok() |> list.sort(),
+      [1, 55]
+    )
+  })
+}
+
+test "saved regressions run before a fresh generator is touched" {
+  fixture.with_directory(fn(directory) {
+    let store = corpus.Store(directory)
+    let _ = store.check(
+      "saved",
+      generator.constant(42),
+      IntegerCodec(),
+      fn(_) { False },
+      property.defaults()
+    ) |> should.be_error()
+    let problem = store.check(
+      "saved",
+      MustNotDraw(),
+      IntegerCodec(),
+      fn(_) { False },
+      property.defaults()
+    ) |> should.be_error()
+    should.equal(problem.value, Some(42))
+    should.equal(problem.generated, None)
+    should.contain_text(problem.message, "saved counterexample")
+  })
+}
+
+test "repeated discoveries deduplicate and passing properties add no files" {
+  fixture.with_directory(fn(directory) {
+    let store = corpus.Store(directory)
+    should.be_ok(
+      store.check(
+        "passing",
+        generator.constant(1),
+        IntegerCodec(),
+        fn(_) { True },
+        property.defaults()
+      )
+    )
+    should.equal(store.examples("passing", IntegerCodec()), Ok([]))
+    list.each([1, 2], fn(_) {
+      let _ = store.check(
+        "same",
+        generator.constant(7),
+        IntegerCodec(),
+        fn(_) { False },
+        property.defaults()
+      ) |> should.be_error()
+      Nil
+    })
+    should.equal(store.examples("same", IntegerCodec()), Ok([7]))
+  })
+}
+
+test "malformed saved values are errors instead of silently skipped cases" {
+  fixture.with_directory(fn(directory) {
+    should.be_ok(file.create_directories(directory + "/broken"))
+    should.be_ok(file.write(directory + "/broken/one.case", "not an integer"))
+    let problem = corpus.Store(directory).check(
+      "broken",
+      MustNotDraw(),
+      IntegerCodec(),
+      fn(_) { True },
+      property.defaults()
+    ) |> should.be_error()
+    should.contain_text(problem.message, "expected a saved integer")
+    should.equal(problem.value, None)
+    should.be_ok(file.write_bytes(directory + "/broken/one.case", <<255>>))
+    should.be_error(corpus.Store(directory).examples("broken", IntegerCodec()))
+  })
+}
+
+test "corpus names cannot escape their store and storage errors remain visible" {
+  fixture.with_directory(fn(directory) {
+    let store = corpus.Store(directory)
+    list.each(["../outside", "", "with/slash", "with.dot"], fn(name) {
+      should.be_error(store.examples(name, IntegerCodec()))
+      Nil
+    })
+    should.be_ok(file.write(directory + "/blocked", "not a directory"))
+    should.be_error(
+      corpus.Store(directory + "/blocked").examples("saved", IntegerCodec())
+    )
+    should.attempt(fn() {
+      store.for_all(
+        "assertion",
+        generator.constant(7),
+        IntegerCodec(),
+        fn(n) { should.equal(n, 0) },
+        property.defaults()
+      )
+    }) |> should.be_error()
+    should.equal(store.examples("assertion", IntegerCodec()), Ok([7]))
+  })
+}
+
+test "concurrent counterexamples share one complete saved value" {
+  fixture.with_directory(fn(directory) {
+    let store = corpus.Store(directory)
+    let replies = process.channel()
+    let save = fn() {
+      replies.send(
+        store.check(
+          "shared",
+          generator.constant(7),
+          IntegerCodec(),
+          fn(_) { False },
+          property.defaults()
+        )
+      )
+    }
+    process.with_task(save, fn(_) {
+      process.with_task(save, fn(_) {
+        should.equal((replies.expect(1000) |> should.be_error()).value, Some(7))
+        should.equal((replies.expect(1000) |> should.be_error()).value, Some(7))
+      })
+    })
+    should.equal(store.examples("shared", IntegerCodec()), Ok([7]))
+  })
+}

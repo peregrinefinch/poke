@@ -1,0 +1,272 @@
+// SPDX-License-Identifier: Apache-2.0
+
+module property_test
+
+import poke/should
+import poke/generator.{Generator, Sample}
+import poke/property
+import pooka/int
+import pooka/list
+import pooka/string
+
+// A caller can supply domain-specific generation through the open interface.
+class FixedFailure with Generator(Int) {
+  sample(seed: Int, size: Int) -> Sample(Int) {
+    Sample(100, generator.next_seed(seed))
+  }
+
+  shrink(value: Int) -> List(Int) {
+    match value <= 1 {
+      True -> [0]
+      False -> {
+        let assert Ok(half) = int.divide(value, 2)
+        [0, half]
+      }
+    }
+  }
+}
+
+class Cyclic with Generator(Int) {
+  sample(seed: Int, size: Int) -> Sample(Int) {
+    Sample(1, seed)
+  }
+
+  shrink(value: Int) -> List(Int) {
+    match value {
+      1 -> [1, 2]
+      _ -> [1, 2]
+    }
+  }
+}
+
+class NoShrink with Generator(Int) {
+  sample(seed: Int, size: Int) -> Sample(Int) {
+    Sample(9, seed)
+  }
+
+  shrink(value: Int) -> List(Int) {
+    []
+  }
+}
+
+test "integer draws are deterministic and stay inside inclusive bounds" {
+  let source = generator.integers(-10, 10)
+  assert source.sample(42, 10) == source.sample(42, 10)
+  list.each(list.range(-100, 100), fn(seed: Int) {
+    let sampled = source.sample(seed, 10)
+    assert sampled.value >= -10 && sampled.value <= 10
+    assert sampled.seed > 0
+  })
+  assert generator.integers(7, 7).sample(0, 0).value == 7
+  assert generator.integers(-7, -7).sample(-1, 0).value == -7
+  let values = list.map(list.range(0, 100), fn(seed: Int) {
+    source.sample(seed, 0).value
+  })
+  assert list.contains(values, -10)
+  assert list.contains(values, 10)
+  assert list.contains(values, 0)
+}
+
+test "integer shrinking respects positive and negative domains" {
+  assert generator.integers(-100, 100).shrink(100) == [
+    0,
+    50,
+    75,
+    88,
+    94,
+    97,
+    99
+  ]
+  assert generator.integers(-100, 100).shrink(-100) == [
+    0,
+    -50,
+    -75,
+    -88,
+    -94,
+    -97,
+    -99
+  ]
+  assert generator.integers(10, 100).shrink(11) == [10]
+  assert generator.integers(-100, -10).shrink(-11) == [-10]
+  assert generator.integers(5, 5).shrink(5) == []
+}
+
+test "booleans constants choices pairs and mapped values compose" {
+  assert generator.booleans().shrink(True) == [False]
+  assert generator.booleans().shrink(False) == []
+  assert generator.constant("owl").sample(9, 0).value == "owl"
+  assert generator.constant("owl").shrink("owl") == []
+  assert generator.elements(["owl", "crow", "hare"]).shrink("hare") == [
+    "owl",
+    "crow"
+  ]
+  let both = generator.pair(generator.constant("owl"), generator.integers(2, 2))
+  assert both.sample(42, 5).value == #("owl", 2)
+  let mapped = generator.map(generator.constant(3), fn(n) { n * 2 })
+  assert mapped.sample(42, 5).value == 6
+  assert mapped.shrink(6) == []
+}
+
+test "lists are bounded by size and shrink values as well as length" {
+  let source = generator.list_of(generator.integers(0, 10), 20)
+  assert source.sample(42, 0).value == []
+  list.each(list.range(0, 100), fn(seed: Int) {
+    assert list.length(source.sample(seed, 3).value) <= 3
+  })
+  let smaller = source.shrink([4, 8])
+  assert list.contains(smaller, [])
+  assert list.contains(smaller, [0, 8])
+  assert list.contains(smaller, [4, 0])
+  assert source.shrink([]) == []
+}
+
+test "string alphabets can include unicode and multi character fragments" {
+  let source = generator.strings(["🦉", "oak", ""], 5)
+  assert source.sample(42, 0).value == ""
+  assert source.shrink("oak🦉") == [""]
+  assert source.shrink("") == []
+  property.for_all(source, fn(text: String) {
+    assert string.length(text) <= 15
+  })
+}
+
+test "good properties complete the requested number of cases" {
+  let config = property.Config(42, 200, 30, 100)
+  let report = should.be_ok(
+    property.check(
+      generator.integers(-1000, 1000),
+      fn(n) { n + 0 == n },
+      config
+    )
+  )
+  assert report.cases == 200
+  assert report.seed == 42
+  property.for_all(
+    generator.list_of(generator.integers(-100, 100), 20),
+    fn(values: List(Int)) {
+      should.equal(list.reverse(list.reverse(values)), values)
+    }
+  )
+}
+
+test "a failure shrinks and carries enough information for exact replay" {
+  let config = property.Config(42, 100, 20, 100)
+  let failure = should.be_error(
+    property.check(FixedFailure(), fn(n) { n == 0 }, config)
+  )
+  assert failure.original == 100
+  assert failure.minimal == 1
+  assert failure.trial == 1
+  assert failure.seed == 42
+  assert property.replay(FixedFailure(), failure.case_seed, failure.size) == failure.original
+  assert failure.shrinks > 0 && failure.shrinks <= 100
+  assert string.contains(property.describe(failure), "case seed 42")
+  assert string.contains(property.describe(failure), "smaller 1")
+}
+
+test "assertions and exceptions are failures rather than successful predicates" {
+  let failure = should.be_error(property.check(
+    generator.constant(2),
+    fn(n) {
+      should.equal(n, 3)
+      True
+    },
+    property.defaults()
+  ))
+  assert string.contains(failure.reason, "expected 3")
+  assert string.contains(failure.reason, "got 2")
+  let message = should.be_error(should.attempt(fn() {
+    property.for_all_with(
+      FixedFailure(),
+      fn(n) { assert n == 0 },
+      property.Config(42, 10, 10, 50)
+    )
+  }))
+  assert string.contains(message, "property failed at trial 1")
+  assert string.contains(message, "smaller 1")
+}
+
+test "cyclic custom shrinkers terminate within their budget" {
+  let failure = should.be_error(
+    property.check(Cyclic(), fn(n) { False }, property.Config(1, 1, 0, 10))
+  )
+  assert failure.shrinks <= 10
+  let fixed = should.be_error(
+    property.check(NoShrink(), fn(n) { False }, property.defaults())
+  )
+  assert fixed.minimal == 9
+  assert fixed.shrinks == 0
+  let unshrunk = should.be_error(
+    property.check(FixedFailure(), fn(n) { False }, property.Config(1, 1, 0, 0))
+  )
+  assert unshrunk.minimal == 100
+  assert unshrunk.shrinks == 0
+}
+
+test "invalid generator and property configurations are rejected" {
+  let _ = should.be_error(should.attempt(fn() { generator.integers(3, 2) }))
+  let _ = should.be_error(should.attempt(fn() { generator.elements([]) }))
+  let _ = should.be_error(should.attempt(fn() {
+    generator.list_of(generator.booleans(), -1)
+  }))
+  let _ = should.be_error(should.attempt(fn() { generator.strings(["x"], -1) }))
+  let _ = should.be_error(should.attempt(fn() {
+    property.check(
+      generator.constant(1),
+      fn(n) { True },
+      property.Config(1, 0, 1, 1)
+    )
+  }))
+  let _ = should.be_error(should.attempt(fn() {
+    property.check(
+      generator.constant(1),
+      fn(n) { True },
+      property.Config(1, 1, -1, 1)
+    )
+  }))
+}
+
+class NoShrinking with Generator(Int) {
+  sample(seed: Int, size: Int) -> Sample(Int) {
+    Sample(12, seed)
+  }
+
+  shrink(value: Int) -> List(Int) {
+    panic as "a zero budget must not call the shrinker"
+  }
+}
+
+test "zero shrink budgets do not invoke custom shrinkers" {
+  let failure = should.be_error(
+    property.check(NoShrinking(), fn(n) { False }, property.Config(1, 1, 0, 0))
+  )
+  assert failure.minimal == 12
+  assert failure.shrinks == 0
+}
+
+test "random streams have known steps and can cover wide integer ranges" {
+  assert generator.next_seed(1) == 48271
+  assert generator.next_seed(48271) == 182605794
+  let base = 1_000_000_000_000_000_000_000_000
+  let source = generator.integers(base, base + 1_000_000_000_000)
+  let values = list.map(list.range(1, 100), fn(seed: Int) {
+    source.sample(seed, 1).value
+  })
+  assert list.all(values, fn(n: Int) {
+    n >= base && n <= base + 1_000_000_000_000
+  })
+  assert list.any(values, fn(n: Int) {
+    n > base + 2_147_483_647 && n < base + 1_000_000_000_000
+  })
+}
+
+test "integer shrinking finds the failing boundary rather than stopping halfway" {
+  let failure = should.be_error(
+    property.check(
+      generator.integers(0, 100),
+      fn(n) { n < 10 },
+      property.Config(42, 100, 20, 100)
+    )
+  )
+  assert failure.minimal == 10
+}

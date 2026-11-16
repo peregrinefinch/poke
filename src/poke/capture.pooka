@@ -1,0 +1,34 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Give a callback a small notebook for its standard output.
+//// The original group leader is restored on success and exceptions, and nested
+//// captures keep separate notebooks. Join child processes before leaving the
+//// scope. This captures standard IO, not global standard_error or logger output;
+//// replacing shared devices would interfere with tests running beside this one.
+module capture
+
+import poke/failure.{Failure}
+
+class Captured(value: a, text: String)
+
+external _Bridge from erlang "poke_capture_ffi" {
+  output(run: fn() -> a) -> #(a, String)
+}
+
+/// Capture standard output, returning the callback's value unchanged. Exceptions
+/// are re-raised after restoring the caller's device and stopping the collector.
+///
+/// ```pooka
+/// let found = capture.output(fn() { io.println("hello") })
+/// should.equal(found.text, "hello\n")
+/// ```
+output(run: fn() -> a) -> Captured(a) {
+  let #(value, text) = _Bridge.output(run)
+  Captured(value, text)
+}
+
+/// Keep the output and a structured failure together when a callback fails.
+/// The callback runs in the current process, so ordinary fixtures still apply.
+attempt(run: fn() -> a) -> Captured(Result(a, Failure)) {
+  output(fn() { failure.capture(run) })
+}

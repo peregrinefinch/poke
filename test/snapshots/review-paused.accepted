@@ -1,0 +1,19 @@
+
+  Reviewing 3 out of 3
+
+  ── new snapshot ────────────────────────────────────────────────────────────
+
+  title: empty
+  file:  test/snapshots/empty.accepted
+
+  ───┬────────────────────────────────────────────────────────────────────────
+     │ ⋯ Empty snapshot
+  ───┴────────────────────────────────────────────────────────────────────────
+
+  · Skipped  empty
+
+  ────────────────────────────────────────────────────────────────────────────
+  Review paused
+
+  ✓ 1 accepted   × 1 rejected   · 1 skipped
+  1 still pending · ready to review on your next visit.

@@ -1,0 +1,87 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Borrow Pooka's lantern colours, and leave plain terminals in peace.
+//// NO_COLOR wins over FORCE_COLOR. A dumb or redirected terminal stays plain.
+module palette
+
+import pooka/env
+import pooka/io
+
+enum Mode {
+  Plain
+  Colour
+}
+
+detect() -> Mode {
+  match _set("NO_COLOR") {
+    True -> Mode.Plain
+    False -> match _set("FORCE_COLOR") {
+      True -> Mode.Colour
+      False -> match env.get("TERM") {
+        Ok(Some("dumb")) -> Mode.Plain
+        _ -> match io.is_terminal() {
+          True -> Mode.Colour
+          False -> Mode.Plain
+        }
+      }
+    }
+  }
+}
+
+_set(name: String) -> Bool {
+  match env.get(name) {
+    Ok(Some(_)) -> True
+    _ -> False
+  }
+}
+
+paint(text: String, escape: String, mode: Mode) -> String {
+  match mode {
+    Mode.Plain -> text
+    Mode.Colour -> escape + text + "\u{1b}[0m"
+  }
+}
+
+heading(text: String, mode: Mode) -> String {
+  paint(text, "\u{1b}[1;38;2;117;97;142m", mode)
+}
+
+added(text: String, mode: Mode) -> String {
+  paint(text, "\u{1b}[38;2;255;137;31m", mode)
+}
+
+removed(text: String, mode: Mode) -> String {
+  paint(text, "\u{1b}[38;2;217;91;23m", mode)
+}
+
+muted(text: String, mode: Mode) -> String {
+  paint(text, "\u{1b}[38;2;139;148;168m", mode)
+}
+
+success(text: String, mode: Mode) -> String {
+  paint(text, "\u{1b}[38;2;97;175;111m", mode)
+}
+
+/// Emphasise only the changed characters, while retaining the row's base colour.
+focus(text: String, addition: Bool, mode: Mode) -> String {
+  match mode {
+    Mode.Plain -> text
+    Mode.Colour -> match addition {
+      True -> "\u{1b}[1;48;2;27;65;39m" + text + "\u{1b}[22;49m"
+      False -> "\u{1b}[1;48;2;80;33;35m" + text + "\u{1b}[22;49m"
+    }
+  }
+}
+
+key(text: String, mode: Mode) -> String {
+  paint(text, "\u{1b}[1;38;2;255;182;75m", mode)
+}
+
+/// Conventional diff colours stay independent of Pooka's surrounding palette.
+diff_added(text: String, mode: Mode) -> String {
+  paint(text, "\u{1b}[32m", mode)
+}
+
+diff_removed(text: String, mode: Mode) -> String {
+  paint(text, "\u{1b}[31m", mode)
+}

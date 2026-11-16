@@ -1,0 +1,140 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// A bug that has been found should not need another lucky seed.
+//// Save the smallest failing value using an explicit text codec. Old examples
+//// run before fresh draws. Nothing evaluates Erlang terms or casts untyped data
+//// back into a test: the codec must validate every saved value on the way in.
+////
+//// ```pooka
+//// class IntegerText with corpus.Codec(Int) {
+////   encode(value: Int) -> String { int.to_string(value) }
+////
+////   decode(text: String) -> Result(Int, String) {
+////     match int.parse(text) {
+////       Ok(value) -> Ok(value)
+////       Error(_) -> Error("expected an integer")
+////     }
+////   }
+//// }
+//// ```
+module corpus
+
+import poke/generator.{Generator}
+import poke/property
+import poke/should
+import pooka/list
+
+/// Change the property name when its encoding or accepted domain changes.
+interface Codec(a) {
+  encode(value: a) -> String
+
+  decode(text: String) -> Result(a, String)
+}
+
+/// Storage errors have no value; observed failures retain their counterexample.
+class Failure(
+  message: String,
+  value: Option(a),
+  generated: Option(property.Failure(a))
+)
+
+external _Bridge from erlang "poke_corpus_ffi" {
+  load(directory: String, name: String) -> Result(List(String), String)
+
+  save(directory: String, name: String, text: String) -> Result(Nil, String)
+}
+
+/// Each property owns a directory of content-addressed .case files. Commit
+/// these small files with the tests. Concurrent saves of one value deduplicate.
+class Store(directory: String) {
+  /// Decode the complete corpus. A corrupt file is an error, never a skipped test.
+  examples(name: String, codec: Codec(a)) -> Result(List(a), String) {
+    let texts = _Bridge.load(directory, name)?
+    list.try_map(texts, fn(text) { codec.decode(text) })
+  }
+
+  /// Replay stored examples first, then generate and shrink new cases.
+  /// A newly discovered failure is saved before being returned to the caller.
+  check(
+    name: String,
+    source: Generator(a),
+    codec: Codec(a),
+    predicate: fn(a) -> Bool,
+    config: property.Config
+  ) -> Result(property.Report, Failure(a)) {
+    match examples(name, codec) {
+      Error(message) -> Error(Failure(message, None, None))
+      Ok(values) -> match _replay(values, predicate) {
+        Error(problem) -> Error(problem)
+        Ok(_) -> match property.check(source, predicate, config) {
+          Ok(report) -> Ok(report)
+          Error(problem) -> {
+            let saved = _Bridge.save(
+              directory,
+              name,
+              codec.encode(problem.minimal)
+            )
+            let message = match saved {
+              Ok(_) -> property.describe(problem)
+              Error(error) -> property.describe(problem) + "\ncould not save counterexample: " + error
+            }
+            Error(Failure(message, Some(problem.minimal), Some(problem)))
+          }
+        }
+      }
+    }
+  }
+
+  /// Assertion-style properties use the same corpus and native failure channel.
+  for_all(
+    name: String,
+    source: Generator(a),
+    codec: Codec(a),
+    assertion: fn(a) -> Nil,
+    config: property.Config
+  ) -> Nil {
+    match check(
+      name,
+      source,
+      codec,
+      fn(value) {
+        assertion(value)
+        True
+      },
+      config
+    ) {
+      Ok(_) -> Nil
+      Error(problem) -> should.fail(problem.message)
+    }
+  }
+}
+
+_replay(values: List(a), predicate: fn(a) -> Bool) -> Result(Nil, Failure(a)) {
+  match values {
+    [] -> Ok(Nil)
+    [value, ..rest] -> match property.check(
+      generator.constant(value),
+      predicate,
+      property.Config(1, 1, 0, 0)
+    ) {
+      Ok(_) -> _replay(rest, predicate)
+      Error(problem) -> Error(
+        Failure(
+          "saved counterexample failed\n" + property.describe(problem),
+          Some(value),
+          None
+        )
+      )
+    }
+  }
+}
+
+/// Keep regression inputs beside the tests rather than in the build cache.
+///
+/// ```pooka
+/// let saved = corpus.defaults()
+/// // saved.for_all("integer-roundtrip-v1", source, codec, assertion, property.defaults())
+/// ```
+defaults() -> Store {
+  Store("test/counterexamples")
+}

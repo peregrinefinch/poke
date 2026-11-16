@@ -1,0 +1,160 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// A small lantern for things that should have worked.
+////
+//// Keep Pooka's own test declarations and runner. These helpers add labelled
+//// comparisons and unwrapping assertions; property and snapshot tests live in
+//// poke/property and poke/snapshot. Nothing installs a second runner.
+////
+//// ```pooka
+//// import poke/should
+////
+//// test "arithmetic keeps its promises" {
+////   should.equal(1 + 1, 2)
+////   should.equal(should.be_ok(Ok("owl")), "owl")
+//// }
+//// ```
+module should
+
+import poke/failure
+import pooka/list
+import pooka/string
+
+external _Bridge from erlang "poke_ffi" {
+  mismatch(message: String, expected: a, actual: b) -> c
+
+  inspect(value: a) -> String
+
+  fail(message: String) -> a
+
+  equal(actual: a, expected: a, message: String) -> Nil
+}
+
+/// Compare actual with expected using Pooka's exact equality. The native runner
+/// receives structured expected/got values and the calling test's location.
+equal(actual: a, expected: a) -> Nil {
+  _Bridge.equal(actual, expected, "values differ")
+}
+
+/// A labelled comparison, useful when several examples share one test.
+///
+/// ```pooka
+/// should.equal_named(2 + 2, 4, "issue-12: adding two pairs")
+/// ```
+equal_named(actual: a, expected: a, label: String) -> Nil {
+  _Bridge.equal(actual, expected, label)
+}
+
+/// Reject an unexpected value.
+not_equal(actual: a, unexpected: a) -> Nil {
+  match actual == unexpected {
+    True -> _Bridge.mismatch(
+      "values should differ",
+      "anything except " + inspect(unexpected),
+      actual
+    )
+    False -> Nil
+  }
+}
+
+/// Require True.
+be_true(actual: Bool) -> Nil {
+  equal(actual, True)
+}
+
+/// Require False.
+be_false(actual: Bool) -> Nil {
+  equal(actual, False)
+}
+
+/// Open Ok or stop the test with the error still visible.
+be_ok(value: Result(a, e)) -> a {
+  match value {
+    Ok(found) -> found
+    Error(_) -> _Bridge.mismatch("expected Ok", "Ok(_)", value)
+  }
+}
+
+/// Open Error or stop the test with the unexpected success visible.
+be_error(value: Result(a, e)) -> e {
+  match value {
+    Error(problem) -> problem
+    Ok(_) -> _Bridge.mismatch("expected Error", "Error(_)", value)
+  }
+}
+
+/// Open Some or stop the test.
+be_some(value: Option(a)) -> a {
+  match value {
+    Some(found) -> found
+    None -> _Bridge.mismatch("expected Some", "Some(_)", value)
+  }
+}
+
+/// Require absence.
+be_none(value: Option(a)) -> Nil {
+  equal(value, None)
+}
+
+/// Stop a test with an explanation.
+fail(message: String) -> a {
+  _Bridge.fail(message)
+}
+
+/// Inspect a Pooka value without printing it. Useful for counterexamples and
+/// explicit value snapshots; text snapshots should keep their text unchanged.
+inspect(value: a) -> String {
+  _Bridge.inspect(value)
+}
+
+/// Observe a callback failure as data. Property checks use this to shrink both
+/// a False predicate and a thrown assertion. It runs in the caller's process;
+/// it does not impose a timeout or undo effects.
+attempt(run: fn() -> a) -> Result(a, String) {
+  match failure.capture(run) {
+    Ok(value) -> Ok(value)
+    Error(problem) -> Error(failure.describe(problem))
+  }
+}
+
+/// Require an item in a list, retaining the whole collection on failure.
+contain(actual: List(a), expected: a) -> Nil {
+  match list.contains(actual, expected) {
+    True -> Nil
+    False -> _Bridge.mismatch(
+      "list should contain " + inspect(expected),
+      "a list containing " + inspect(expected),
+      actual
+    )
+  }
+}
+
+/// Require a literal substring, without treating it as a regular expression.
+contain_text(actual: String, expected: String) -> Nil {
+  match string.contains(actual, expected) {
+    True -> Nil
+    False -> _Bridge.mismatch(
+      "text should contain " + inspect(expected),
+      expected,
+      actual
+    )
+  }
+}
+
+/// Compare finite floating-point values with an absolute tolerance.
+be_close(actual: Float, expected: Float, tolerance: Float) -> Nil {
+  match tolerance < 0.0 {
+    True -> fail("tolerance must not be negative")
+    False -> {
+      let delta = actual - expected
+      match delta <= tolerance && delta >= -tolerance {
+        True -> Nil
+        False -> _Bridge.mismatch(
+          "values differ beyond tolerance " + inspect(tolerance),
+          expected,
+          actual
+        )
+      }
+    }
+  }
+}

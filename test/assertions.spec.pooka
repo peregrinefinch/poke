@@ -1,0 +1,77 @@
+// SPDX-License-Identifier: Apache-2.0
+
+module assertions_test
+
+import poke/should
+import poke/regression
+import pooka/string
+
+class Bird(name: String)
+
+test "equality and ordinary unwrapping use the native runner" {
+  should.equal(1 + 1, 2)
+  should.equal_named([1, 2], [1, 2], "a small procession")
+  should.not_equal(1, 2)
+  should.be_true(True)
+  should.be_false(False)
+  should.equal(should.be_ok(Ok("owl")), "owl")
+  should.equal(should.be_error(Error("missing")), "missing")
+  should.equal(should.be_some(Some(7)), 7)
+  should.be_none(None)
+}
+
+test "assertion exceptions remain observable failures" {
+  let failure = should.be_error(should.attempt(fn() {
+    should.equal_named(1, 2, "arithmetic")
+  }))
+  assert string.contains(failure, "arithmetic")
+  assert string.contains(failure, "expected 2")
+  assert string.contains(failure, "got 1")
+  let _ = should.be_error(should.attempt(fn() { should.equal(1, 2) }))
+  let _ = should.be_error(should.attempt(fn() { should.not_equal(1, 1) }))
+  let _ = should.be_error(should.attempt(fn() { should.be_true(False) }))
+  let _ = should.be_error(should.attempt(fn() { should.be_false(True) }))
+}
+
+test "wrong wrappers fail without returning a made up value" {
+  let _ = should.be_error(should.attempt(fn() { should.be_ok(Error("no")) }))
+  let _ = should.be_error(should.attempt(fn() { should.be_error(Ok(3)) }))
+  let _ = should.be_error(should.attempt(fn() { should.be_some(None) }))
+  let _ = should.be_error(should.attempt(fn() { should.be_none(Some(3)) }))
+  should.equal(
+    should.be_error(should.attempt(fn() {
+      should.fail("a deliberate ghost")
+    })),
+    "a deliberate ghost"
+  )
+  should.equal(should.be_ok(should.attempt(fn() { 42 })), 42)
+}
+
+test "inspection speaks Pooka and escapes text" {
+  assert should.inspect(#(True, False, Nil, None)) == "#(True, False, Nil, None)"
+  assert should.inspect(Ok(Some([1, 2]))) == "Ok(Some([1, 2]))"
+  assert should.inspect(Error("a\n\"b\"")) == "Error(\"a\\n\\\"b\\\"\")"
+  assert should.inspect(Bird("owl")) == "Bird(\"owl\")"
+  assert should.inspect("🦉\u{0}") == "\"🦉\\u{0}\""
+}
+
+test "regressions name their cases and keep expected values" {
+  regression.check(
+    [
+      regression.Case("issue-12", 2, 4),
+      regression.Case("issue-13", 0, 0),
+      regression.Case("negative", -2, -4)
+    ],
+    fn(n) { n * 2 }
+  )
+  let failure = should.be_error(should.attempt(fn() {
+    regression.check([regression.Case("issue-14", 2, 5)], fn(n) { n * 2 })
+  }))
+  assert string.contains(failure, "regression: issue-14")
+  assert string.contains(failure, "expected 5")
+  assert string.contains(failure, "got 4")
+}
+
+test "empty regressions do not call the function" {
+  regression.check([], fn(n: Int) { panic as "an empty table has no examples" })
+}

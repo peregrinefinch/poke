@@ -1,0 +1,169 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Compare each real step with a small model of what ought to happen.
+//// Construct fresh real state for each property trial, using a fixture when it
+//// needs cleanup. Commands must be valid for the supplied initial model.
+//// Commands describes which steps can follow each model state; commands builds
+//// sequences from it and rejects illegal shrink candidates. Real effects run
+//// only through check or check_commands, after a complete precondition check.
+module model
+
+import poke/generator.{Generator, Sample}
+import poke/should
+import pooka/list
+import pooka/int
+
+/// Run a deterministic command sequence. The first mismatch names its step.
+check(
+  commands: List(c),
+  initial: s,
+  predict: fn(s, c) -> #(s, r),
+  perform: fn(c) -> r
+) -> s {
+  _steps(commands, initial, predict, perform, 1)
+}
+
+_steps(
+  commands: List(c),
+  state: s,
+  predict: fn(s, c) -> #(s, r),
+  perform: fn(c) -> r,
+  index: Int
+) -> s {
+  match commands {
+    [] -> state
+    [command, ..rest] -> {
+      let #(next, expected) = predict(state, command)
+      let actual = perform(command)
+      should.equal_named(
+        actual,
+        expected,
+        "model step " + int.to_string(index) + ": " + should.inspect(command)
+      )
+      _steps(rest, next, predict, perform, index + 1)
+    }
+  }
+}
+
+/// A pure description of legal commands and replies. Return None from generate
+/// when there is no legal next step. Never perform real effects in predict.
+interface Commands(s, c, r) {
+  initial() -> s
+
+  generate(state: s, seed: Int, size: Int) -> Sample(Option(c))
+
+  valid(state: s, command: c) -> Bool
+
+  predict(state: s, command: c) -> #(s, r)
+
+  shrink(command: c) -> List(c)
+}
+
+/// Generate from the evolving model. Shrinks are retained only when the whole
+/// smaller sequence remains legal, including commands after a removed step.
+///
+/// ```pooka
+/// property.for_all(model.commands(machine, 30), fn(commands) {
+///   // create fresh real state, then model.check_commands(commands, machine, perform)
+/// })
+/// ```
+commands(machine: Commands(s, c, r), maximum: Int) -> Generator(List(c)) {
+  match maximum < 0 {
+    True -> panic as "model.commands requires a nonnegative maximum"
+    False -> _Commands(machine, maximum)
+  }
+}
+
+class _Commands(machine: Commands(s, c, r), maximum: Int) with Generator(
+  List(c)
+) {
+  sample(seed: Int, size: Int) -> Sample(List(c)) {
+    let length = generator.integers(0, int.max(0, int.min(maximum, size))).sample(
+      seed,
+      size
+    )
+    _generate(machine, machine.initial(), length.value, length.seed, size, [])
+  }
+
+  shrink(values: List(c)) -> List(List(c)) {
+    let candidates = generator.list_of(_Command(machine), maximum).shrink(
+      values
+    )
+    list.filter(candidates, fn(candidate) {
+      _valid(candidate, machine, machine.initial())
+    })
+  }
+}
+
+class _Command(machine: Commands(s, c, r)) with Generator(c) {
+  sample(seed: Int, size: Int) -> Sample(c) {
+    panic as "command elements are sampled through the evolving model"
+  }
+
+  shrink(command: c) -> List(c) {
+    machine.shrink(command)
+  }
+}
+
+_generate(
+  machine: Commands(s, c, r),
+  state: s,
+  remaining: Int,
+  seed: Int,
+  size: Int,
+  acc: List(c)
+) -> Sample(List(c)) {
+  match remaining <= 0 {
+    True -> Sample(list.reverse(acc), seed)
+    False -> {
+      let drawn = machine.generate(state, seed, size)
+      match drawn.value {
+        None -> Sample(list.reverse(acc), drawn.seed)
+        Some(command) -> match machine.valid(state, command) {
+          False -> panic as "model generated a command whose precondition is false"
+          True -> {
+            let #(next, _) = machine.predict(state, command)
+            _generate(
+              machine,
+              next,
+              remaining - 1,
+              drawn.seed,
+              size,
+              list.prepend(acc, command)
+            )
+          }
+        }
+      }
+    }
+  }
+}
+
+_valid(commands: List(c), machine: Commands(s, c, r), state: s) -> Bool {
+  match commands {
+    [] -> True
+    [command, ..rest] -> match machine.valid(state, command) {
+      False -> False
+      True -> {
+        let #(next, _) = machine.predict(state, command)
+        _valid(rest, machine, next)
+      }
+    }
+  }
+}
+
+/// Validate a hand-written sequence before allowing it to touch real state.
+check_commands(
+  commands: List(c),
+  machine: Commands(s, c, r),
+  perform: fn(c) -> r
+) -> s {
+  match _valid(commands, machine, machine.initial()) {
+    False -> should.fail("model command sequence has a false precondition")
+    True -> check(
+      commands,
+      machine.initial(),
+      fn(state, command) { machine.predict(state, command) },
+      perform
+    )
+  }
+}

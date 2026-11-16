@@ -1,0 +1,229 @@
+// SPDX-License-Identifier: Apache-2.0
+
+module toolkit_test
+
+import poke/should
+import poke/fixture
+import poke/process
+import poke/model
+import poke/property
+import poke/generator
+import pooka/file
+
+external Probe from erlang "poke_probe" {
+  sleep(milliseconds: Int) -> Nil
+
+  alive(pid: Pid) -> Bool
+
+  self_pid() -> Pid
+}
+
+test "assertions support pipelines and collection checks" {
+  Ok(Some(42)) |> should.be_ok() |> should.be_some() |> should.equal(42)
+  should.contain([1, 2, 3], 2)
+  should.contain_text("a small owl", "owl")
+  should.be_close(0.1 + 0.2, 0.3, 0.000001)
+  should.be_close(2.0, 2.0, 0.0)
+}
+
+test "collection and float assertions reject mismatches" {
+  should.attempt(fn() { should.contain([1], 2) }) |> should.be_error()
+  should.attempt(fn() { should.contain_text("owl", "cat") }) |> should.be_error()
+  should.attempt(fn() { should.be_close(1.0, 2.0, 0.1) }) |> should.be_error()
+  should.attempt(fn() { should.be_close(1.0, 1.0, -0.1) }) |> should.be_error()
+}
+
+test "temporary directories are unique and removed after success" {
+  let path = fixture.with_directory(fn(path) {
+    should.be_ok(file.write(path + "/note", "hello"))
+    should.equal(should.be_ok(file.read(path + "/note")), "hello")
+    let other = fixture.with_directory(fn(other) { other })
+    should.not_equal(path, other)
+    path
+  })
+  should.equal(should.be_ok(file.exists(path)), False)
+}
+
+test "resource cleanup runs after an assertion failure" {
+  let messages = process.channel()
+  should.attempt(fn() {
+    fixture.with_resource(
+      fn() { "borrowed" },
+      fn(resource) { messages.send(resource) },
+      fn(_) { should.equal(1, 2) }
+    )
+  }) |> should.be_error()
+  should.equal(messages.expect(1000), "borrowed")
+  should.be_error(messages.receive(0))
+}
+
+test "failed setup never cleans a resource it did not acquire" {
+  let messages = process.channel()
+  should.attempt(fn() {
+    fixture.with_resource(
+      fn() -> Int { panic as "setup failed" },
+      fn(_) { messages.send("unexpected cleanup") },
+      fn(value) { value }
+    )
+  }) |> should.be_error()
+  should.be_error(messages.receive(0))
+}
+
+test "directory cleanup also runs after a failed callback" {
+  let paths = process.channel()
+  should.attempt(fn() {
+    fixture.with_directory(fn(path) {
+      paths.send(path)
+      should.be_ok(file.create_directories(path + "/nested"))
+      should.be_ok(file.write(path + "/nested/note", "hello"))
+      should.fail("finished badly")
+    })
+  }) |> should.be_error()
+  let path = paths.expect(1000)
+  should.equal(should.be_ok(file.exists(path)), False)
+}
+
+test "tagged channels preserve messages meant for other channels" {
+  let first = process.channel()
+  let second = process.channel()
+  second.send("second")
+  first.send(42)
+  should.equal(first.expect(0), 42)
+  should.equal(second.expect(0), "second")
+  should.equal(should.be_error(first.receive(0)), "message timed out")
+  should.equal(
+    should.be_error(first.receive(-1)),
+    "timeout must be nonnegative"
+  )
+}
+
+test "workers send typed messages back to the test" {
+  let messages = process.channel()
+  let result = process.within(1000, fn() { messages.send(42) })
+  should.be_ok(result)
+  should.equal(messages.expect(1000), 42)
+}
+
+test "channels reject receiving outside their owner" {
+  let messages = process.channel()
+  messages.send(42)
+  let result = process.within(1000, fn() { messages.receive(0) }) |> should.be_ok()
+  should.equal(
+    should.be_error(result),
+    "channel can only receive in its owner process"
+  )
+  should.equal(messages.expect(0), 42)
+}
+
+test "bounded workers return successes and meaningful crashes" {
+  should.equal(process.within(1000, fn() { 42 }) |> should.be_ok(), 42)
+  let reason = process.crashes(1000, fn() { panic as "broken kettle" })
+  should.contain_text(reason, "broken kettle")
+  should.attempt(fn() { process.crashes(1000, fn() { 42 }) }) |> should.be_error()
+  should.be_error(process.within(-1, fn() { 42 }))
+}
+
+test "timed out workers are terminated before returning" {
+  let workers = process.channel()
+  let result = process.within(50, fn() {
+    workers.send(Probe.self_pid())
+    Probe.sleep(10000)
+  })
+  should.equal(should.be_error(result), "worker timed out")
+  should.equal(Probe.alive(workers.expect(1000)), False)
+}
+
+test "task fixtures join workers on both success and failure" {
+  let pid = process.with_task(fn() { Probe.sleep(10000) }, fn(pid) { pid })
+  should.equal(Probe.alive(pid), False)
+  let workers = process.channel()
+  should.attempt(fn() {
+    process.with_task(fn() { Probe.sleep(10000) }, fn(pid) {
+      workers.send(pid)
+      should.fail("test failed")
+    })
+  }) |> should.be_error()
+  should.equal(Probe.alive(workers.expect(1000)), False)
+}
+
+actor Counter {
+  var count: Int
+
+  new() {
+    self.count = 0
+  }
+
+  pid() -> Pid {
+    Probe.self_pid()
+  }
+
+  add(amount: Int) -> Int {
+    count += amount
+    count
+  }
+}
+
+test "stateful properties compare an actor with a pure model" {
+  property.for_all(
+    generator.list_of(generator.integers(-10, 10), 20),
+    fn(commands) {
+      let counter = Counter()
+      let _ = process.with_process(counter.pid(), fn(_) {
+        model.check(
+          commands,
+          0,
+          fn(state, amount) {
+            #(state + amount, state + amount)
+          },
+          fn(amount) { counter.add(amount) }
+        )
+      })
+      Nil
+    }
+  )
+}
+
+test "model failures name the command and retain expected and actual values" {
+  let message = should.attempt(fn() {
+    model.check(
+      [2, 3],
+      0,
+      fn(state, amount) { #(state + amount, state + amount) },
+      fn(amount) { amount + 1 }
+    )
+  }) |> should.be_error()
+  should.contain_text(message, "model step 1")
+  should.contain_text(message, "expected 2")
+  should.contain_text(message, "got 3")
+  should.equal(
+    model.check(
+      [],
+      7,
+      fn(state: Int, command: Int) { #(state, command) },
+      fn(value) { value }
+    ),
+    7
+  )
+}
+
+test "a timeout is not accepted as an expected crash" {
+  let outcome = should.attempt(fn() {
+    process.crashes(1, fn() { Probe.sleep(10000) })
+  })
+  should.be_error(outcome) |> should.contain_text("timed out")
+}
+
+test "a naturally finished owned task is still joined" {
+  let messages = process.channel()
+  let pid = process.with_task(fn() { messages.send("done") }, fn(pid) {
+    should.equal(messages.expect(1000), "done")
+    pid
+  })
+  should.equal(Probe.alive(pid), False)
+}
+
+test "invalid deadlines cannot count as expected crashes" {
+  should.attempt(fn() { process.crashes(-1, fn() { 42 }) })
+  |> should.be_error()
+  |> should.contain_text("timeout must be nonnegative")
+}

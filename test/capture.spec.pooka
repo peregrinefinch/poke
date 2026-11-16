@@ -1,0 +1,104 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Return the borrowed IO device even when the callback falls over.
+module capture_test
+
+import poke/should
+import poke/failure
+import poke/capture
+import poke/process
+import pooka/io
+
+external Probe from erlang "poke_probe" {
+  current_leader() -> Pid
+
+  alive(pid: Pid) -> Bool
+
+  sleep(milliseconds: Int) -> Nil
+
+  wait_dead(pid: Pid, milliseconds: Int) -> Bool
+
+  io_requests() -> Nil
+
+  fail() -> Nil
+}
+
+test "output capture retains values Unicode and line endings" {
+  let original = Probe.current_leader()
+  let captured = capture.output(fn() {
+    should.be_ok(io.println("hello 🦉"))
+    42
+  })
+  should.equal(captured.value, 42)
+  should.equal(captured.text, "hello 🦉\n")
+  should.equal(Probe.current_leader(), original)
+}
+
+test "nested captures have separate output and restore their parent" {
+  let outer = capture.output(fn() {
+    should.be_ok(io.println("before"))
+    let inner = capture.output(fn() { should.be_ok(io.println("inside")) })
+    should.equal(inner.text, "inside\n")
+    should.be_ok(io.println("after"))
+  })
+  should.equal(outer.text, "before\nafter\n")
+}
+
+test "failed captures retain text and restore the original group leader" {
+  let original = Probe.current_leader()
+  let captured = capture.attempt(fn() {
+    should.be_ok(io.println("before failure"))
+    should.equal(1, 2)
+  })
+  should.equal(captured.text, "before failure\n")
+  should.equal(should.be_error(captured.value).kind, failure.Kind.Comparison)
+  should.equal(Probe.current_leader(), original)
+  should.attempt(fn() {
+    capture.output(fn() { should.fail("uncaught inside") })
+  }) |> should.be_error()
+  should.equal(Probe.current_leader(), original)
+}
+
+test "the output collector is joined before a capture returns" {
+  let captured = capture.output(fn() { Probe.current_leader() })
+  should.be_false(Probe.alive(captured.value))
+}
+
+test "capture handles compound requests and recovers from invalid requests" {
+  let captured = capture.output(fn() {
+    Probe.io_requests()
+    should.be_ok(io.println("three"))
+  })
+  should.equal(captured.text, "onetwothree\n")
+}
+
+test "children share capture while joined inside its scope" {
+  let captured = capture.output(fn() {
+    process.within(1000, fn() { should.be_ok(io.println("from a child")) }) |> should.be_ok()
+  })
+  should.equal(captured.text, "from a child\n")
+}
+
+test "a killed capture owner does not orphan its collector" {
+  let collectors = process.channel()
+  let result = process.within(100, fn() {
+    capture.output(fn() {
+      collectors.send(Probe.current_leader())
+      Probe.sleep(10000)
+    })
+  })
+  should.be_error(result)
+  should.be_true(Probe.wait_dead(collectors.expect(1000), 1000))
+}
+
+test "nested capture failure restores the outer collector" {
+  let found = capture.output(fn() {
+    let broken = capture.attempt(fn() { Probe.fail() })
+    should.equal(
+      (broken.value |> should.be_error()).kind,
+      failure.Kind.Exception
+    )
+    should.be_ok(io.println("outer still works"))
+  })
+  should.equal(found.text, "outer still works\n")
+}

@@ -1,0 +1,135 @@
+//// Print values so that people can read them.
+////
+//// `echo` puts a value on one line, however long. Poke’s formatter lays it out: a value
+//// that fits the width stays on one line, and one that does not is broken
+//// over several, indented, one item per line. Output stays plain in terminals and snapshot files.
+////
+//// ```pooka
+//// import poke/pretty
+////
+//// class Owl(name: String, age: Int, friends: List(String))
+////
+//// main() {
+////   pretty.print(Owl("Ada", 3, ["Bramble", "Fig", "Thistle"]))
+//// }
+//// ```
+////
+//// Poke’s formatter shows values the way they are written in Pooka: `Some(1)`,
+//// `#(1, "a")`, `Owl("Ada", 3, [])`. Field names are not kept when a program
+//// runs, so fields appear in the order they were declared.
+
+// SPDX-License-Identifier: Apache-2.0
+
+module pretty
+
+/// How to lay a value out.
+///
+/// - `width`: the longest line allowed, in characters.
+/// - `indent`: how many spaces each level moves to the right.
+/// - `max_items`: show at most this many items of a list, dict or set, then
+///   say how many were left out. `0` shows them all.
+/// - `max_depth`: show at most this many levels, then `...`. `0` shows them
+///   all.
+class Options(
+  width: Int,
+  indent: Int,
+  max_items: Int,
+  max_depth: Int,
+) {
+  with_width(width: Int) -> Options {
+    Options(width, indent, max_items, max_depth)
+  }
+
+  with_indent(indent: Int) -> Options {
+    Options(width, indent, max_items, max_depth)
+  }
+
+  with_max_items(max_items: Int) -> Options {
+    Options(width, indent, max_items, max_depth)
+  }
+
+  with_max_depth(max_depth: Int) -> Options {
+    Options(width, indent, max_items, max_depth)
+  }
+}
+
+external _Ffi from erlang "poke_pretty_ffi" {
+  format(
+    value: a,
+    width: Int,
+    indent: Int,
+    max_items: Int,
+    max_depth: Int
+  ) -> String
+
+  terminal_width() -> Int
+
+  write(text: String) -> Nil
+}
+
+/// Plain text, 80 characters wide, indented by two spaces, nothing left out.
+///
+/// ```pooka
+/// import poke/pretty
+///
+/// let narrow = pretty.defaults().with_width(40).with_max_items(10)
+/// ```
+defaults() -> Options {
+  Options(80, 2, 0, 0)
+}
+
+/// Fit the terminal width, keeping output plain.
+terminal() -> Options {
+  Options(_Ffi.terminal_width(), 2, 0, 0)
+}
+
+/// Lay a value out as plain text.
+///
+/// ```pooka
+/// import poke/pretty
+///
+/// assert pretty.format(#(1, "owl", Some(True))) == "#(1, \"owl\", Some(True))"
+/// ```
+format(value: a) -> String {
+  format_with(value, defaults())
+}
+
+/// Lay a value out with your own options.
+///
+/// ```pooka
+/// import poke/pretty
+///
+/// let options = pretty.defaults().with_width(8)
+/// assert pretty.format_with([100, 200, 300], options) == "[\n  100,\n  200,\n  300\n]"
+/// ```
+format_with(value: a, options: Options) -> String {
+  _Ffi.format(
+    value,
+    options.width,
+    options.indent,
+    options.max_items,
+    options.max_depth
+  )
+}
+
+/// Print a value to standard output, fitted to the terminal, and hand the
+/// same value back, so it can sit in the middle of a pipeline.
+///
+/// ```pooka
+/// import poke/pretty
+///
+/// main() {
+///   let total = pretty.print([1, 2, 3])
+///   pretty.print(total)
+/// }
+/// ```
+print(value: a) -> a {
+  print_with(value, terminal())
+}
+
+/// Print a value to standard output with your own options, and hand the same
+/// value back.
+print_with(value: a, options: Options) -> a {
+  _Ffi.write(format_with(value, options))
+  value
+}

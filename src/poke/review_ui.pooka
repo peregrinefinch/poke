@@ -1,0 +1,110 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// A review has a name, a place and a decision. Keep those visible around the
+//// diff, with the same frame in plain terminals and coloured ones. This module
+//// is pure so the whole conversation can be snapshot-tested without a terminal.
+module review_ui
+
+import poke/diff.{Comparison, View}
+import poke/palette.{Mode}
+import poke/terminal
+import pooka/int
+import pooka/string
+
+class Progress(accepted: Int, rejected: Int, skipped: Int)
+
+header(
+  name: String,
+  directory: String,
+  index: Int,
+  total: Int,
+  comparison: Comparison,
+  _view: View,
+  width: Int,
+  mode: Mode
+) -> String {
+  let title = match comparison.is_new {
+    True -> "new snapshot"
+    False -> "mismatched snapshots"
+  }
+  let rule = "── " + title + " "
+  "\n  " + palette.muted("Reviewing ", mode)
+    + palette.key(int.to_string(index), mode) + palette.muted(" out of ", mode)
+    + palette.key(int.to_string(total), mode) + "\n\n"
+    + "  " + palette.heading(
+    rule + string.repeat("─", int.max(0, width - terminal.cells(rule))),
+    mode
+  ) + "\n\n"
+    + "  " + palette.key("title: ", mode) + string.trim_end(
+    terminal.fit(terminal.safe(name), width - 7)
+  ) + "\n"
+    + "  " + palette.key("file:  ", mode) + string.trim_end(
+    terminal.fit(terminal.safe(directory + "/" + name + ".accepted"), width - 7)
+  ) + "\n"
+    + match comparison.is_new {
+    True -> "\n"
+    False -> "\n  " + palette.diff_removed("- old snapshot", mode)
+      + "\n  " + palette.diff_added("+ new snapshot", mode) + "\n\n"
+  }
+}
+
+actions(show_diff: Bool, _view: View, _width: Int, mode: Mode) -> String {
+  let toggle = match show_diff {
+    True -> "hide diff"
+    False -> "show diff"
+  }
+  "\n"
+    + _action("a", "accept", "accept the new snapshot", mode)
+    + _action("r", "reject", "keep the accepted snapshot", mode)
+    + _action("s", "skip", "leave this candidate for later", mode)
+    + _action("d", toggle, "toggle the snapshot diff", mode)
+    + _action("↵", "refresh", "redraw at the current terminal width", mode)
+    + _action("q", "quit", "return to the remaining snapshots later", mode)
+    + "\n  " + palette.muted("Choose an action, then Enter", mode) + palette.key(
+    "  > ",
+    mode
+  )
+}
+
+_action(key: String, label: String, description: String, mode: Mode) -> String {
+  "  " + palette.key(key, mode) + "  " + label
+    + string.repeat(" ", int.max(1, 12 - terminal.cells(label)))
+    + palette.muted(description, mode) + "\n"
+}
+
+feedback(action: String, name: String, mode: Mode) -> String {
+  let text = "\n  " + action + "  " + terminal.safe(name) + "\n"
+  match action {
+    "✓ Accepted" -> palette.success(text, mode)
+    "× Rejected" -> palette.removed(text, mode)
+    _ -> palette.muted(text, mode)
+  }
+}
+
+summary(progress: Progress, pending: Int, width: Int, mode: Mode) -> String {
+  let title = match pending > 0 {
+    True -> "Review paused"
+    False -> "Review complete"
+  }
+  "\n  " + palette.muted(string.repeat("─", width), mode) + "\n"
+    + "  " + palette.heading(title, mode) + "\n\n"
+    + "  " + palette.success(
+    "✓ " + int.to_string(progress.accepted) + " accepted",
+    mode
+  )
+    + "   " + palette.removed(
+    "× " + int.to_string(progress.rejected) + " rejected",
+    mode
+  )
+    + "   " + palette.muted(
+    "· " + int.to_string(progress.skipped) + " skipped",
+    mode
+  )
+    + "\n  " + match pending > 0 {
+    True -> palette.muted(
+      int.to_string(pending) + " still pending · ready to review on your next visit.\n",
+      mode
+    )
+    False -> palette.success("All candidates have been reviewed.\n", mode)
+  }
+}

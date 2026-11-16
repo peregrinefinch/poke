@@ -1,0 +1,78 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Keep a failure in a small, labelled box before deciding how to show it.
+//// Comparisons retain separate expected and actual text, formatted with the
+//// same plain printer used for snapshots. Capture observes exceptions in this
+//// process; it does not impose a deadline or undo the callback's effects.
+module failure
+
+import poke/pretty
+
+/// Every assertion family has a stable category, without exposing BEAM terms.
+enum Kind {
+  Comparison
+  Assertion
+  Panic
+  Exception
+}
+
+class Failure(
+  kind: Kind,
+  message: String,
+  expected: Option(String),
+  actual: Option(String)
+)
+
+external _Bridge from erlang "poke_ffi" {
+  capture_failure(run: fn() -> a) -> Result(
+    a,
+    #(String, String, Option(String), Option(String))
+  )
+}
+
+/// Observe an assertion, panic or foreign exception as structured data.
+///
+/// ```pooka
+/// let problem = failure.capture(fn() { should.equal(1, 2) }) |> should.be_error()
+/// should.equal(problem.expected, Some("2"))
+/// ```
+capture(run: fn() -> a) -> Result(a, Failure) {
+  match _Bridge.capture_failure(run) {
+    Ok(value) -> Ok(value)
+    Error(#(kind, message, expected, actual)) -> {
+      let category = match kind {
+        "comparison" -> Kind.Comparison
+        "assertion" -> Kind.Assertion
+        "panic" -> Kind.Panic
+        _ -> Kind.Exception
+      }
+      Error(Failure(category, message, expected, actual))
+    }
+  }
+}
+
+/// Build a comparison without raising, useful for custom assertion libraries.
+compare(actual: a, expected: a, label: String) -> Result(Nil, Failure) {
+  match actual == expected {
+    True -> Ok(Nil)
+    False -> Error(Failure(
+      Kind.Comparison,
+      label,
+      Some(pretty.format(expected)),
+      Some(pretty.format(actual))
+    ))
+  }
+}
+
+/// Format one complete report. No terminal colours or presentation truncation.
+describe(problem: Failure) -> String {
+  let wanted = match problem.expected {
+    None -> ""
+    Some(value) -> "\nexpected " + value
+  }
+  let found = match problem.actual {
+    None -> ""
+    Some(value) -> "\ngot " + value
+  }
+  problem.message + wanted + found
+}

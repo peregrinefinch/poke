@@ -1,0 +1,20 @@
+name = "poke"
+version = "1.0.0"
+description = "Poke your code to find bugs!"
+authors = ["Peregrine Finch"]
+licences = ["Apache-2.0"]
+repository = { type = "github", user = "peregrinefinch", repo = "poke" }
+links = [
+  { title = "Issues", href = "https://github.com/peregrinefinch/poke/issues" },
+  { title = "Compiler", href = "https://github.com/pooka-lang/pooka" },
+]
+
+[dependencies]
+pooka_stdlib = ">= 0.3.1 and < 1.0.0"
+
+[dev-dependencies]
+
+[[documentation.pages]]
+title = "Testing with Poke"
+path = "guide.html"
+source = "docs/guide.md"

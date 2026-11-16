@@ -1,0 +1,21 @@
+
+  Reviewing 2 out of 3
+
+  ── new snapshot ────────────────────────────────────────────────────────────
+
+  title: configuration
+  file:  test/snapshots/configuration.accepted
+
+  ───┬────────────────────────────────────────────────────────────────────────
+   1 + name = owl
+   2 + port = 8080
+  ───┴────────────────────────────────────────────────────────────────────────
+
+  a  accept      accept the new snapshot
+  r  reject      keep the accepted snapshot
+  s  skip        leave this candidate for later
+  d  hide diff   toggle the snapshot diff
+  ↵  refresh     redraw at the current terminal width
+  q  quit        return to the remaining snapshots later
+
+  Choose an action, then Enter  > 

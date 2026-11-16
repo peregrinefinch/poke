@@ -1,0 +1,4 @@
+* text=auto eol=lf
+
+# Snapshot bytes include intentional spaces and newline differences.
+test/snapshots/*.accepted -text -whitespace

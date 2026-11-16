@@ -1,0 +1,26 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Borrow a resource, and return it even when a test fails.
+//// Cleanup runs for successful callbacks and exceptions. Abrupt process death
+//// cannot run an after block; the temporary root is kept under build for that case.
+module fixture
+
+external _Bridge from erlang "poke_test_ffi" {
+  with_resource(setup: fn() -> a, cleanup: fn(a) -> Nil, run: fn(a) -> b) -> b
+
+  with_directory(run: fn(String) -> a) -> a
+}
+
+/// Setup runs once. Cleanup runs once after the callback, including on failure.
+with_resource(setup: fn() -> a, cleanup: fn(a) -> Nil, run: fn(a) -> b) -> b {
+  _Bridge.with_resource(setup, cleanup, run)
+}
+
+/// Each callback owns a fresh directory. It and its contents are removed on exit.
+///
+/// ```pooka
+/// fixture.with_directory(fn(path) { should.be_ok(file.write(path + "/note", "hello")) })
+/// ```
+with_directory(run: fn(String) -> a) -> a {
+  _Bridge.with_directory(run)
+}

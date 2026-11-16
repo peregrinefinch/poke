@@ -1,0 +1,420 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Review the things that changed before calling them expected.
+////
+//// The same entry point works through pooka run or an exported poke escript.
+//// Interactive EOF and quit leave pending files alone. Bulk accept/reject are
+//// explicit commands; running tests never invokes this module for you.
+module cli
+
+import poke/snapshot.{Store}
+import poke/palette.{Mode}
+import poke/diff.{View}
+import poke/review_ui.{Progress}
+import poke/terminal
+import pooka/env
+import pooka/io
+import pooka/list
+import pooka/result
+import pooka/string
+
+class Options(
+  command: String,
+  directory: String,
+  name: Option(String),
+  plain: Bool
+)
+
+class _Decision(choice: Choice, view: View)
+
+enum Choice {
+  Accept
+  Reject
+  Skip
+  Quit
+}
+
+external _Bridge from erlang "poke_ffi" {
+  halt(code: Int) -> Nil
+}
+
+help() -> String {
+  "Poke snapshot review\n\n"
+    + "Usage: poke [review|list|accept|reject] [options]\n\n"
+    + "  review               Review candidates one by one (default)\n"
+    + "  list                 List pending snapshot names\n"
+    + "  accept               Accept all selected candidates\n"
+    + "  reject               Discard all selected candidates\n\n"
+    + "  --directory PATH     Snapshot directory (default: test/snapshots)\n"
+    + "  --name NAME          Select one pending snapshot\n"
+    + "  --no-color           Plain terminal output\n"
+    + "  -h, --help           Show help\n\n"
+    + "From your project: pooka run -m poke review\n"
+    + "Export a standalone command with pooka export escript.\n"
+}
+
+/// Parse without touching the filesystem or terminal. Invalid options never
+/// fall through to acceptance or rejection.
+parse(arguments: List(String)) -> Result(Options, String) {
+  match arguments {
+    [] -> Ok(Options("review", "test/snapshots", None, False))
+    ["--help"] -> Ok(Options("help", "", None, True))
+    ["-h"] -> Ok(Options("help", "", None, True))
+    [command, ..rest] if command == "review" || command == "list" || command == "accept" || command == "reject" ->
+    _options(rest, Options(command, "test/snapshots", None, False))
+    [first, .._ignored] -> Error("unknown command: " + first)
+  }
+}
+
+_options(arguments: List(String), options: Options) -> Result(Options, String) {
+  match arguments {
+    [] -> Ok(options)
+    ["--directory", directory, ..rest] if directory != "" -> _options(
+      rest,
+      Options(options.command, directory, options.name, options.plain)
+    )
+    ["--name", name, ..rest] if name != "" -> _options(
+      rest,
+      Options(options.command, options.directory, Some(name), options.plain)
+    )
+    ["--no-color", ..rest] -> _options(
+      rest,
+      Options(options.command, options.directory, options.name, True)
+    )
+    ["--help", .._ignored] -> Ok(Options("help", "", None, True))
+    ["-h", .._ignored] -> Ok(Options("help", "", None, True))
+    [other, .._ignored] -> Error("unknown or incomplete option: " + other)
+  }
+}
+
+/// Inject input and output when testing the review conversation. The callbacks
+/// use Result so a closed output pipe cannot silently accept the next snapshot.
+review(
+  store: Store,
+  mode: Mode,
+  ask: fn() -> Result(Option(String), String),
+  tell: fn(String) -> Result(Nil, String)
+) -> Result(Nil, String) {
+  let names = (store.pending() |> result.map_error(snapshot.describe))?
+  review_selected(store, names, mode, ask, tell)
+}
+
+review_selected(
+  store: Store,
+  names: List(String),
+  mode: Mode,
+  ask: fn() -> Result(Option(String), String),
+  tell: fn(String) -> Result(Nil, String)
+) -> Result(Nil, String) {
+  review_selected_with_width(store, names, mode, ask, tell, terminal.columns)
+}
+
+/// Supply a live content-width reader when embedding the reviewer. The normal
+/// entry point reads terminal geometry again for each redraw and candidate.
+review_selected_with_width(
+  store: Store,
+  names: List(String),
+  mode: Mode,
+  ask: fn() -> Result(Option(String), String),
+  tell: fn(String) -> Result(Nil, String),
+  measure: fn() -> Int
+) -> Result(Nil, String) {
+  match names {
+    [] -> tell(
+      "No pending snapshots in " + store.directory + ".\n"
+        + "Run pooka test to stage new or changed snapshots, then review again.\n"
+        + "Only .new candidates need review; .accepted files are already reviewed.\n"
+    )
+    _ -> {
+      let width = measure
+      let view = View.Unified
+      _review(
+        store,
+        names,
+        mode,
+        ask,
+        tell,
+        1,
+        list.length(names),
+        Progress(0, 0, 0),
+        width,
+        view
+      )
+    }
+  }
+}
+
+_review(
+  store: Store,
+  names: List(String),
+  mode: Mode,
+  ask: fn() -> Result(Option(String), String),
+  tell: fn(String) -> Result(Nil, String),
+  index: Int,
+  total: Int,
+  progress: Progress,
+  width: fn() -> Int,
+  view: View
+) -> Result(Nil, String) {
+  match names {
+    [] -> tell(review_ui.summary(progress, progress.skipped, width(), mode))
+    [name, ..rest] -> {
+      let #(before, after) = (
+        store.versions(name) |> result.map_error(snapshot.describe)
+      )?
+      let comparison = diff.compare(before, after)
+      tell(
+        review_ui.header(
+          name,
+          store.directory,
+          index,
+          total,
+          comparison,
+          view,
+          width(),
+          mode
+        )
+      )?
+      let decision = _choose(
+        store,
+        name,
+        before,
+        after,
+        view,
+        width,
+        mode,
+        ask,
+        tell,
+        True,
+        True,
+        0
+      )?
+      match decision.choice {
+        Choice.Quit -> tell(
+          review_ui.summary(
+            progress,
+            progress.skipped + list.length(names),
+            width(),
+            mode
+          )
+        )
+        _ -> {
+          let progress = match decision.choice {
+            Choice.Accept -> Progress(
+              progress.accepted + 1,
+              progress.rejected,
+              progress.skipped
+            )
+            Choice.Reject -> Progress(
+              progress.accepted,
+              progress.rejected + 1,
+              progress.skipped
+            )
+            _ -> Progress(
+              progress.accepted,
+              progress.rejected,
+              progress.skipped + 1
+            )
+          }
+          _review(
+            store,
+            rest,
+            mode,
+            ask,
+            tell,
+            index + 1,
+            total,
+            progress,
+            width,
+            decision.view
+          )
+        }
+      }
+    }
+  }
+}
+
+// Refresh for Enter, a diff toggle, or changed terminal geometry. An invalid
+// answer at the same width keeps the existing preview instead of flooding it.
+_choose(
+  store: Store,
+  name: String,
+  before: Option(String),
+  after: String,
+  view: View,
+  width: fn() -> Int,
+  mode: Mode,
+  ask: fn() -> Result(Option(String), String),
+  tell: fn(String) -> Result(Nil, String),
+  show_diff: Bool,
+  redraw: Bool,
+  previous_width: Int
+) -> Result(_Decision, String) {
+  let available = width()
+  match redraw || available != previous_width {
+    True -> {
+      let preview = match show_diff {
+        True -> diff.render_with(before, after, View.Unified, available, mode)
+        False -> diff.render_candidate(after, available, mode)
+      }
+      tell(preview)?
+    }
+    False -> Nil
+  }
+  tell(review_ui.actions(show_diff, view, available, mode))?
+  let input = ask()?
+  match input {
+    None -> Ok(_Decision(Choice.Quit, view))
+    Some(word) -> match string.lowercase(string.trim(word)) {
+      "" -> _choose(
+        store,
+        name,
+        before,
+        after,
+        view,
+        width,
+        mode,
+        ask,
+        tell,
+        show_diff,
+        True,
+        available
+      )
+      "a" -> {
+        _accept_reviewed(store, name, before, after)?
+        tell(review_ui.feedback("✓ Accepted", name, mode))?
+        Ok(_Decision(Choice.Accept, view))
+      }
+      "r" -> {
+        (
+          store.reject(name) |> result.map_error(snapshot.describe)
+        )?
+        tell(review_ui.feedback("× Rejected", name, mode))?
+        Ok(_Decision(Choice.Reject, view))
+      }
+      "s" -> {
+        tell(review_ui.feedback("· Skipped", name, mode))?
+        Ok(_Decision(Choice.Skip, view))
+      }
+      "q" -> Ok(_Decision(Choice.Quit, view))
+      "d" -> _choose(
+        store,
+        name,
+        before,
+        after,
+        view,
+        width,
+        mode,
+        ask,
+        tell,
+        !show_diff,
+        True,
+        available
+      )
+      _ -> {
+        tell(
+          palette.removed(
+            "\n  Unknown action. Choose a, r, s, d or q.\n",
+            mode
+          )
+        )?
+        _choose(
+          store,
+          name,
+          before,
+          after,
+          view,
+          width,
+          mode,
+          ask,
+          tell,
+          show_diff,
+          False,
+          available
+        )
+      }
+    }
+  }
+}
+
+// The person accepts the version they saw, not a candidate that a parallel
+// test run replaced while the prompt was waiting for an answer.
+_accept_reviewed(
+  store: Store,
+  name: String,
+  before: Option(String),
+  after: String
+) -> Result(Nil, String) {
+  let current = (store.versions(name) |> result.map_error(snapshot.describe))?
+  match current == #(before, after) {
+    True -> store.accept(name) |> result.map_error(snapshot.describe)
+    False -> Error(
+      "snapshot changed while reviewing " + name + "; review the new candidate before accepting"
+    )
+  }
+}
+
+run(options: Options) -> Result(Nil, String) {
+  match options.command {
+    "help" -> _tell(help())
+    _ -> {
+      let store = Store(options.directory)
+      let pending = (store.pending() |> result.map_error(snapshot.describe))?
+      let selected = match options.name {
+        None -> Ok(pending)
+        Some(name) -> match list.contains(pending, name) {
+          True -> Ok([name])
+          False -> Error("no pending snapshot named " + name)
+        }
+      }
+      let names = selected?
+      let mode = match options.plain {
+        True -> Mode.Plain
+        False -> palette.detect()
+      }
+      match options.command {
+        "review" -> review_selected(store, names, mode, _ask, _tell)
+        "list" -> _tell(string.join(names, "\n") + "\n")
+        "accept" -> list.try_each(names, fn(name: String) {
+          (
+            store.accept(name) |> result.map_error(snapshot.describe)
+          )?
+          _tell(palette.success("✓ accepted " + name + "\n", mode))
+        })
+        "reject" -> list.try_each(names, fn(name: String) {
+          (
+            store.reject(name) |> result.map_error(snapshot.describe)
+          )?
+          _tell(palette.removed("- rejected " + name + "\n", mode))
+        })
+        _ -> Error("unknown command: " + options.command)
+      }
+    }
+  }
+}
+
+_tell(text: String) -> Result(Nil, String) {
+  io.print(text) |> result.map_error(fn(problem: io.IoError) {
+    problem.message
+  })
+}
+
+_ask() -> Result(Option(String), String) {
+  io.read_line() |> result.map_error(fn(problem: io.IoError) {
+    problem.message
+  })
+}
+
+main() {
+  let outcome = match parse(env.args()) {
+    Error(message) -> Error(message)
+    Ok(options) -> run(options)
+  }
+  match outcome {
+    Ok(_) -> Nil
+    Error(message) -> {
+      let _ = io.eprintln("poke: " + message)
+      _Bridge.halt(1)
+    }
+  }
+}

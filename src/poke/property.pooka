@@ -1,0 +1,214 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Ask the same question of many small worlds.
+////
+//// Checks use an explicit seed and bounded shrinking. A counterexample carries
+//// the original value, the smaller failure and the exact seed/size for replay.
+//// Properties should be pure: shrinking repeats the callback. Exceptions are
+//// failures too, but callbacks have no automatic timeout.
+module property
+
+import poke/pretty
+import poke/should
+import poke/generator.{Generator}
+import pooka/int
+import pooka/list
+
+/// cases must be positive; sizes and shrink budgets must be nonnegative.
+class Config(seed: Int, cases: Int, max_size: Int, max_shrinks: Int)
+
+class Report(seed: Int, cases: Int)
+
+class Failure(
+  seed: Int,
+  trial: Int,
+  case_seed: Int,
+  size: Int,
+  original: a,
+  minimal: a,
+  reason: String,
+  shrinks: Int
+)
+
+class _Shrunk(value: a, reason: String, attempts: Int)
+
+/// A repeatable default, rather than a fresh mystery on every run.
+defaults() -> Config {
+  Config(2026, 100, 50, 100)
+}
+
+/// Check a Boolean predicate, returning a replayable failure instead of raising.
+///
+/// ```pooka
+/// property.check(generator.integers(-20, 20), fn(n) { n + 0 == n }, property.defaults())
+/// ```
+check(source: Generator(a), predicate: fn(a) -> Bool, config: Config) -> Result(
+  Report,
+  Failure(a)
+) {
+  match config.cases <= 0 || config.max_size < 0 || config.max_shrinks < 0 {
+    True -> panic as "property Config requires positive cases and nonnegative sizes/budgets"
+    False -> _check(source, predicate, config, config.seed, 0)
+  }
+}
+
+_check(
+  source: Generator(a),
+  predicate: fn(a) -> Bool,
+  config: Config,
+  seed: Int,
+  trial: Int
+) -> Result(Report, Failure(a)) {
+  match trial >= config.cases {
+    True -> Ok(Report(config.seed, trial))
+    False -> {
+      let size = trial % (config.max_size + 1)
+      let sample = source.sample(seed, size)
+      match _evaluate(predicate, sample.value) {
+        None -> _check(source, predicate, config, sample.seed, trial + 1)
+        Some(reason) -> {
+          let candidates = match config.max_shrinks == 0 {
+            True -> []
+            False -> source.shrink(sample.value)
+          }
+          let smaller = _shrink(
+            source,
+            predicate,
+            sample.value,
+            reason,
+            [sample.value],
+            candidates,
+            config.max_shrinks,
+            0
+          )
+          Error(
+            Failure(
+              config.seed,
+              trial + 1,
+              seed,
+              size,
+              sample.value,
+              smaller.value,
+              smaller.reason,
+              smaller.attempts
+            )
+          )
+        }
+      }
+    }
+  }
+}
+
+_evaluate(predicate: fn(a) -> Bool, value: a) -> Option(String) {
+  match should.attempt(fn() { predicate(value) }) {
+    Ok(True) -> None
+    Ok(False) -> Some("predicate returned False")
+    Error(message) -> Some(message)
+  }
+}
+
+// Every evaluated candidate spends budget. Visited candidates cannot send a
+// custom shrinker around a cycle. The first smaller failure starts a new search.
+_shrink(
+  source: Generator(a),
+  predicate: fn(a) -> Bool,
+  value: a,
+  reason: String,
+  visited: List(a),
+  candidates: List(a),
+  budget: Int,
+  attempts: Int
+) -> _Shrunk(a) {
+  match budget <= 0 {
+    True -> _Shrunk(value, reason, attempts)
+    False -> match candidates {
+      [] -> _Shrunk(value, reason, attempts)
+      [candidate, ..rest] -> match list.contains(visited, candidate) {
+        True -> _shrink(
+          source,
+          predicate,
+          value,
+          reason,
+          visited,
+          rest,
+          budget - 1,
+          attempts + 1
+        )
+        False -> {
+          let visited = list.prepend(visited, candidate)
+          match _evaluate(predicate, candidate) {
+            None -> _shrink(
+              source,
+              predicate,
+              value,
+              reason,
+              visited,
+              rest,
+              budget - 1,
+              attempts + 1
+            )
+            Some(message) -> {
+              let next = match budget <= 1 {
+                True -> []
+                False -> source.shrink(candidate)
+              }
+              _shrink(
+                source,
+                predicate,
+                candidate,
+                message,
+                visited,
+                next,
+                budget - 1,
+                attempts + 1
+              )
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/// Run assertion-style properties with the default seed and bounds.
+///
+/// ```pooka
+/// property.for_all(generator.integers(-100, 100), fn(n) {
+///   should.equal(n + 0, n)
+/// })
+/// ```
+for_all(source: Generator(a), assertion: fn(a) -> Nil) -> Nil {
+  for_all_with(source, assertion, defaults())
+}
+
+/// Choose a seed and bounds explicitly. The failure message includes replay data.
+for_all_with(source: Generator(a), assertion: fn(a) -> Nil, config: Config) -> Nil {
+  let result = check(
+    source,
+    fn(value: a) {
+      assertion(value)
+      True
+    },
+    config
+  )
+  match result {
+    Ok(_) -> Nil
+    Error(problem) -> should.fail(describe(problem))
+  }
+}
+
+/// Replay just one failing sample using Failure.case_seed and Failure.size.
+replay(source: Generator(a), case_seed: Int, size: Int) -> a {
+  source.sample(case_seed, size).value
+}
+
+/// Show a counterexample without hiding the seed behind a stack trace.
+describe(problem: Failure(a)) -> String {
+  "property failed at trial " + int.to_string(problem.trial)
+    + "\nseed " + int.to_string(problem.seed)
+    + ", case seed " + int.to_string(problem.case_seed)
+    + ", size " + int.to_string(problem.size)
+    + "\noriginal " + pretty.format(problem.original)
+    + "\nsmaller " + pretty.format(problem.minimal)
+    + "\n" + problem.reason
+}

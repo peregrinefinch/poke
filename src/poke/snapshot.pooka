@@ -1,0 +1,235 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Leave a candidate by the door; acceptance is a separate decision.
+////
+//// Matching snapshots pass. Missing or changed snapshots write a .new file and
+//// fail until reviewed. Tests never accept their own output, including in CI.
+//// Accepted files contain exact UTF-8 text, without headers or terminal colours.
+module snapshot
+
+import poke/pretty
+import poke/should
+import poke/diff
+import poke/palette.{Mode}
+import pooka/file
+import pooka/list
+import pooka/path
+import pooka/result
+import pooka/string
+
+enum Kind {
+  Missing
+  Changed
+  Io
+  InvalidName
+}
+
+class SnapshotError(kind: Kind, path: String, message: String)
+
+external _Bridge from erlang "poke_ffi" {
+  write_atomic(path: String, text: String) -> Result(Nil, String)
+}
+
+/// A caller-chosen directory. Names use ASCII letters/digits, '-' or '_',
+/// at most 120 characters. Use unique names for simultaneously running tests.
+class Store(directory: String) {
+  /// Compare exact text. A matching accepted file removes a stale candidate.
+  check(content: String, name: String) -> Result(Nil, SnapshotError) {
+    _name(name)?
+    let accepted = _path(directory, name, ".accepted")
+    let pending = _path(directory, name, ".new")
+    let exists = _exists(accepted)?
+    match exists {
+      True -> {
+        let previous = _read(accepted)?
+        match previous == content {
+          True -> _remove_if_present(pending)
+          False -> {
+            _prepare(directory)?
+            _write(pending, content)?
+            Error(
+              SnapshotError(Kind.Changed, pending, "snapshot changed: " + name)
+            )
+          }
+        }
+      }
+      False -> {
+        _prepare(directory)?
+        _write(pending, content)?
+        Error(
+          SnapshotError(
+            Kind.Missing,
+            pending,
+            "snapshot needs acceptance: " + name
+          )
+        )
+      }
+    }
+  }
+
+  /// Copy the reviewed candidate into place atomically, then remove it.
+  accept(name: String) -> Result(Nil, SnapshotError) {
+    _name(name)?
+    let pending = _path(directory, name, ".new")
+    let content = _read(pending)?
+    _write(_path(directory, name, ".accepted"), content)?
+    _remove_if_present(pending)
+  }
+
+  /// Discard the candidate, keeping any accepted snapshot untouched.
+  reject(name: String) -> Result(Nil, SnapshotError) {
+    _name(name)?
+    _remove_if_present(_path(directory, name, ".new"))
+  }
+
+  /// Pending safe file names in stable order. Missing directories are empty.
+  pending() -> Result(List(String), SnapshotError) {
+    let exists = _exists(directory)?
+    match exists {
+      False -> Ok([])
+      True -> {
+        let entries = (
+          file.list_directory(directory) |> result.map_error(_file_error)
+        )?
+        let candidates = list.filter_map(entries, fn(entry: String) {
+          match string.ends_with(entry, ".new") {
+            False -> None
+            True -> {
+              let name = string.drop_end(entry, 4)
+              match _name(name) {
+                Ok(_) -> Some(name)
+                Error(_) -> None
+              }
+            }
+          }
+        })
+        list.try_fold(candidates, [], fn(found: List(String), name: String) {
+          let regular = (
+            file.is_file(_path(directory, name, ".new")) |> result.map_error(
+              _file_error
+            )
+          )?
+          Ok(match regular {
+            True -> list.prepend(found, name)
+            False -> found
+          })
+        }) |> result.map(list.sort)
+      }
+    }
+  }
+
+  /// Read both versions once for a review screen. No files are changed.
+  versions(name: String) -> Result(#(Option(String), String), SnapshotError) {
+    _name(name)?
+    let candidate = _read(_path(directory, name, ".new"))?
+    let accepted = _path(directory, name, ".accepted")
+    let exists = _exists(accepted)?
+    match exists {
+      True -> {
+        let previous = _read(accepted)?
+        Ok(#(Some(previous), candidate))
+      }
+      False -> Ok(#(None, candidate))
+    }
+  }
+
+  /// A coloured or plain preview. Reading it never changes either file.
+  preview(name: String, mode: Mode) -> Result(String, SnapshotError) {
+    let #(previous, candidate) = versions(name)?
+    Ok(diff.render(previous, candidate, mode))
+  }
+}
+
+/// The default store, relative to the package where pooka test is run.
+default_store() -> Store {
+  Store("test/snapshots")
+}
+
+/// A snapshot assertion that fits an ordinary test declaration.
+///
+/// ```pooka
+/// snapshot.snap("hello\n", "greeting")
+/// ```
+snap(content: String, name: String) -> Nil {
+  match default_store().check(content, name) {
+    Ok(_) -> Nil
+    Error(problem) -> should.fail(
+      describe(problem) + "\nRun poke review to inspect pending snapshots."
+    )
+  }
+}
+
+describe(problem: SnapshotError) -> String {
+  problem.message + "\n" + problem.path
+}
+
+_name(name: String) -> Result(Nil, SnapshotError) {
+  let valid = name != "" && string.length(name) <= 120 && list.all(
+    string.to_list(name),
+    fn(c: Int) {
+      (
+        c >= 65 && c <= 90
+      ) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 45 || c == 95
+    }
+  )
+  match valid {
+    True -> Ok(Nil)
+    False -> Error(
+      SnapshotError(
+        Kind.InvalidName,
+        name,
+        "snapshot names need 1–120 ASCII letters, digits, '-' or '_'"
+      )
+    )
+  }
+}
+
+_path(directory: String, name: String, suffix: String) -> String {
+  path.join([directory, name + suffix])
+}
+
+_file_error(problem: file.FileError) -> SnapshotError {
+  SnapshotError(Kind.Io, problem.path, problem.message)
+}
+
+_exists(path: String) -> Result(Bool, SnapshotError) {
+  file.exists(path) |> result.map_error(_file_error)
+}
+
+_read(path: String) -> Result(String, SnapshotError) {
+  file.read(path) |> result.map_error(_file_error)
+}
+
+_prepare(directory: String) -> Result(Nil, SnapshotError) {
+  file.create_directories(directory) |> result.map_error(_file_error)
+}
+
+_write(path: String, text: String) -> Result(Nil, SnapshotError) {
+  _Bridge.write_atomic(path, text) |> result.map_error(fn(message: String) {
+    SnapshotError(Kind.Io, path, message)
+  })
+}
+
+_remove_if_present(path: String) -> Result(Nil, SnapshotError) {
+  let exists = _exists(path)?
+  match exists {
+    False -> Ok(Nil)
+    True -> file.delete(path) |> result.map_error(_file_error)
+  }
+}
+
+/// Snapshot a complete value with fixed-width, colour-free formatting.
+///
+/// ```pooka
+/// snapshot.value(Ok([1, 2, 3]), "numbers")
+/// ```
+value(actual: a, name: String) -> Nil {
+  snap(pretty.format(actual), name)
+}
+
+/// Choose layout width and indentation. Snapshot values are never truncated
+/// even when display limits are supplied. Output is always plain.
+value_with(actual: a, name: String, options: pretty.Options) -> Nil {
+  let stable = options.with_max_items(0).with_max_depth(0)
+  snap(pretty.format_with(actual, stable), name)
+}

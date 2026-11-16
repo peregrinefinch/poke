@@ -1,0 +1,211 @@
+// SPDX-License-Identifier: Apache-2.0
+
+module cli_test
+
+import poke/capture
+import poke/fixture
+import pooka/io
+import poke/should
+import poke/cli
+import poke/snapshot.{Store}
+import poke/palette.{Mode}
+import pooka/file
+import pooka/list
+import pooka/string
+
+// A mailbox is useful here: it models successive answers to an interactive
+// prompt while the review code itself keeps input/output injectable.
+actor Answers {
+  var words: List(String) = ["d", "d", "what", "a"]
+
+  read() -> Result(Option(String), String) {
+    match words {
+      [] -> Ok(None)
+      [head, ..tail] -> {
+        words = tail
+        Ok(Some(head))
+      }
+    }
+  }
+}
+
+_store(name: String) -> Store {
+  let store = Store("build/poke-tests/cli-" + name)
+  should.be_ok(file.create_directories(store.directory))
+  list.each(["one", "two"], fn(name: String) {
+    should.be_ok(store.reject(name))
+    let accepted = store.directory + "/" + name + ".accepted"
+    match should.be_ok(file.exists(accepted)) {
+      True -> should.be_ok(file.delete(accepted))
+      False -> Nil
+    }
+    let _ = should.be_error(store.check(name, name))
+  })
+  store
+}
+
+_tell(text: String) -> Result(Nil, String) {
+  Ok(Nil)
+}
+
+test "CLI parsing has safe defaults and explicit selection" {
+  let options = should.be_ok(cli.parse([]))
+  assert options.command == "review"
+  assert options.directory == "test/snapshots"
+  assert options.name == None
+  let selected = should.be_ok(
+    cli.parse(
+      ["accept", "--name", "bird", "--directory", "snapshots", "--no-color"]
+    )
+  )
+  assert selected.command == "accept"
+  assert selected.name == Some("bird")
+  assert selected.directory == "snapshots"
+  assert selected.plain
+  assert should.be_ok(cli.parse(["--help"])).command == "help"
+  assert string.contains(cli.help(), "review")
+}
+
+test "invalid CLI arguments cannot become acceptance commands" {
+  list.each(
+    [
+      ["unknown"],
+      ["accept", "--directory"],
+      ["reject", "--name"],
+      ["review", "--wat"],
+      ["list", "extra"]
+    ],
+    fn(arguments: List(String)) {
+      let _ = should.be_error(cli.parse(arguments))
+    }
+  )
+}
+
+test "EOF and skip preserve all pending snapshots" {
+  let eof = _store("eof")
+  should.be_ok(cli.review(eof, Mode.Plain, fn() { Ok(None) }, _tell))
+  assert should.be_ok(eof.pending()) == ["one", "two"]
+  let skipped = _store("skip")
+  should.be_ok(cli.review(skipped, Mode.Plain, fn() { Ok(Some("s")) }, _tell))
+  assert should.be_ok(skipped.pending()) == ["one", "two"]
+}
+
+test "interactive acceptance and rejection apply only after a choice" {
+  let accepted = _store("accept")
+  should.be_ok(cli.review(accepted, Mode.Plain, fn() { Ok(Some("a")) }, _tell))
+  assert should.be_ok(accepted.pending()) == []
+  assert should.be_ok(file.read(accepted.directory + "/one.accepted")) == "one"
+  let rejected = _store("reject")
+  should.be_ok(cli.review(rejected, Mode.Plain, fn() { Ok(Some("r")) }, _tell))
+  assert should.be_ok(rejected.pending()) == []
+  assert should.be_ok(file.exists(rejected.directory + "/one.accepted")) == False
+}
+
+test "review supports diff toggles and invalid answers before acceptance" {
+  let store = _store("toggle")
+  let answers = Answers()
+  should.be_ok(cli.review(store, Mode.Plain, answers.read, _tell))
+  assert should.be_ok(store.pending()) == ["two"]
+  assert should.be_ok(file.read(store.directory + "/one.accepted")) == "one"
+}
+
+test "closed input or output leaves unreviewed candidates intact" {
+  let store = _store("io")
+  assert cli.review(store, Mode.Plain, fn() { Error("input closed") }, _tell) == Error(
+    "input closed"
+  )
+  assert cli.review(
+    store,
+    Mode.Plain,
+    fn() { Ok(Some("a")) },
+    fn(text: String) { Error("output closed") }
+  ) == Error("output closed")
+  assert should.be_ok(store.pending()) == ["one", "two"]
+}
+
+test "empty reviews identify the searched directory and explain staging" {
+  should.be_ok(cli.review_selected(
+    Store("test/snapshots"),
+    [],
+    Mode.Plain,
+    fn() { panic as "an empty review must not ask a question" },
+    fn(text: String) {
+      assert string.contains(text, "test/snapshots")
+      assert string.contains(text, "Run pooka test")
+      assert string.contains(text, ".new")
+      Ok(Nil)
+    }
+  ))
+}
+
+test "interactive acceptance refuses a candidate changed after its preview" {
+  let store = _store("changed-during-review")
+  let outcome = cli.review_selected(
+    store,
+    ["one"],
+    Mode.Plain,
+    fn() {
+      should.be_ok(
+        file.write(store.directory + "/one.new", "changed after preview")
+      )
+      Ok(Some("a"))
+    },
+    _tell
+  )
+  assert string.contains(should.be_error(outcome), "changed while reviewing")
+  assert should.be_ok(file.exists(store.directory + "/one.accepted")) == False
+  assert should.be_ok(file.read(store.directory + "/one.new")) == "changed after preview"
+}
+
+actor ResizingTerminal {
+  var width: Int = 24
+  var reads: Int = 0
+
+  columns() -> Int {
+    width
+  }
+
+  read() -> Result(Option(String), String) {
+    match reads == 0 {
+      True -> {
+        width = 240
+        reads += 1
+        Ok(Some(""))
+      }
+      False -> Ok(Some("q"))
+    }
+  }
+}
+
+test "Enter refreshes the same candidate using the current terminal width" {
+  fixture.with_directory(fn(directory) {
+    let store = Store(directory)
+    let text = string.repeat("abcd", 50)
+    let _ = should.be_error(store.check(text, "wide"))
+    let terminal = ResizingTerminal()
+    let found = capture.output(fn() {
+      cli.review_selected_with_width(
+        store,
+        ["wide"],
+        Mode.Plain,
+        terminal.read,
+        fn(text) { io.print(text) |> pooka_error() },
+        terminal.columns
+      )
+    })
+    should.be_ok(found.value)
+    assert string.contains(found.text, " ↪ ")
+    assert string.contains(found.text, text)
+    assert !string.contains(found.text, "Unknown action")
+    assert should.be_ok(store.pending()) == ["wide"]
+    assert should.be_ok(file.read(directory + "/wide.new")) == text
+    assert should.be_ok(file.exists(directory + "/wide.accepted")) == False
+  })
+}
+
+pooka_error(result: Result(Nil, io.IoError)) -> Result(Nil, String) {
+  match result {
+    Ok(value) -> Ok(value)
+    Error(problem) -> Error(problem.message)
+  }
+}

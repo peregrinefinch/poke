@@ -1,0 +1,74 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// A mailbox should answer before the kettle goes cold.
+//// Channels use unique tags and selective receive: unrelated messages stay in
+//// the mailbox. A channel is owned by the process that created it. Timeouts are
+//// milliseconds and must be nonnegative. No helper guesses a waiting period.
+module process
+
+import poke/should
+
+external _Bridge from erlang "poke_test_ffi" {
+  channel() -> #(Pid, Int)
+
+  send(pid: Pid, tag: Int, value: a) -> Nil
+
+  receive_message(pid: Pid, tag: Int, milliseconds: Int) -> Result(a, String)
+
+  within(run: fn() -> a, milliseconds: Int) -> Result(a, String)
+
+  with_process(pid: Pid, use_process: fn(Pid) -> a) -> a
+
+  with_task(run: fn() -> Nil, use_task: fn(Pid) -> a) -> a
+}
+
+/// A typed channel. Share this value with a worker; receive in its owner only.
+class Channel(owner: Pid, tag: Int, type_hint: Option(a)) {
+  send(value: a) -> Nil {
+    _Bridge.send(owner, tag, value)
+  }
+
+  receive(milliseconds: Int) -> Result(a, String) {
+    _Bridge.receive_message(owner, tag, milliseconds)
+  }
+
+  expect(milliseconds: Int) -> a {
+    should.be_ok(receive(milliseconds))
+  }
+}
+
+channel() -> Channel(a) {
+  let #(owner, tag) = _Bridge.channel()
+  Channel(owner, tag, None)
+}
+
+/// Execute in a monitored worker. A timeout kills and joins that worker.
+within(milliseconds: Int, run: fn() -> a) -> Result(a, String) {
+  _Bridge.within(run, milliseconds)
+}
+
+/// Own a worker for one callback. It is killed and joined when the callback ends.
+with_task(run: fn() -> Nil, use_task: fn(Pid) -> a) -> a {
+  _Bridge.with_task(run, use_task)
+}
+
+/// Expect an exception or abnormal process exit; a timeout is not a crash.
+crashes(milliseconds: Int, run: fn() -> a) -> String {
+  match within(milliseconds, run) {
+    Ok(_) -> should.fail("expected a crash, but the callback returned")
+    Error("worker timed out") -> should.fail(
+      "expected a crash, but the worker timed out"
+    )
+    Error("timeout must be nonnegative") -> should.fail(
+      "timeout must be nonnegative"
+    )
+    Error(reason) -> reason
+  }
+}
+
+/// Adopt an existing actor or process for a callback, then kill and join it.
+/// Only pass processes owned by the test; shared application processes belong
+/// to their supervisor instead.
+with_process(pid: Pid, use_process: fn(Pid) -> a) -> a {
+  _Bridge.with_process(pid, use_process)
+}

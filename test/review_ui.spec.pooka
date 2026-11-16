@@ -1,0 +1,275 @@
+// SPDX-License-Identifier: Apache-2.0
+
+module review_ui_test
+
+import poke/diff.{Kind, View, Line, Comparison}
+import poke/generator
+import poke/property
+import poke/snapshot
+import poke/palette.{Mode}
+import poke/review_ui.{Progress}
+import poke/terminal
+import pooka/list
+import pooka/int
+import pooka/string
+
+_restore(comparison: Comparison, old: Bool, newline: Bool) -> String {
+  let lines = list.filter_map(comparison.lines, fn(line: Line) {
+    match line.kind == Kind.Context || (old && line.kind == Kind.Removed) || (
+      !old && line.kind == Kind.Added
+    ) {
+      True -> Some(line.text)
+      False -> None
+    }
+  })
+  string.join(lines, "\n") + match newline {
+    True -> "\n"
+    False -> ""
+  }
+}
+
+test "separated changes retain their shared lines" {
+  let comparison = diff.compare(Some("a\nb\nc\nd\ne\n"), "a\nB\nc\nD\ne\n")
+  assert comparison.added == 2
+  assert comparison.removed == 2
+  assert list.count(comparison.lines, fn(line: Line) {
+    line.kind == Kind.Context
+  }) == 3
+  assert _restore(comparison, True, True) == "a\nb\nc\nd\ne\n"
+  assert _restore(comparison, False, True) == "a\nB\nc\nD\ne\n"
+}
+
+test "property: diff rows reconstruct both inputs with consecutive line numbers" {
+  let words = generator.list_of(
+    generator.elements(["owl", "crow", "", "oak"]),
+    12
+  )
+  property.for_all(
+    generator.pair(words, words),
+    fn(pair: #(List(String), List(String))) {
+      let #(a, b) = pair
+      let old = string.join(a, "\n")
+      let fresh = string.join(b, "\n")
+      let comparison = diff.compare(Some(old), fresh)
+      assert _restore(comparison, True, string.ends_with(old, "\n")) == old
+      assert _restore(comparison, False, string.ends_with(fresh, "\n")) == fresh
+      let old_numbers = list.filter_map(comparison.lines, fn(line: Line) {
+        line.old
+      })
+      let new_numbers = list.filter_map(comparison.lines, fn(line: Line) {
+        line.fresh
+      })
+      assert old_numbers == list.range(1, list.length(old_numbers) + 1)
+      assert new_numbers == list.range(1, list.length(new_numbers) + 1)
+    }
+  )
+}
+
+test "large diff fallback preserves both documents and compacts context" {
+  let old = list.range(0, 400) |> list.map(int.to_string) |> string.join("\n")
+  let fresh = string.replace(old, "\n200\n", "\nchanged\n")
+  let comparison = diff.compare(Some(old), fresh)
+  assert _restore(comparison, True, False) == old
+  assert _restore(comparison, False, False) == fresh
+  assert list.any(diff.compact(comparison.lines), fn(line: Line) {
+    line.kind == Kind.Gap
+  })
+  assert comparison.added == 1
+  assert comparison.removed == 1
+}
+
+test "newline-only changes do not invent deleted or added empty lines" {
+  let comparison = diff.compare(Some("owl"), "owl\n")
+  assert comparison.added == 0 && comparison.removed == 0
+  assert list.any(comparison.lines, fn(line: Line) { line.kind == Kind.Ending })
+  assert diff.compare(None, "").lines == []
+  assert string.contains(diff.render(None, "", Mode.Plain), "Empty snapshot")
+}
+
+test "terminal fitting keeps emoji combining marks and frames aligned" {
+  assert terminal.cells("🦉") == 2
+  assert terminal.cells("界") == 2
+  assert terminal.cells("e\u{301}") == 1
+  assert terminal.cells("👨‍👩‍👧‍👦") == 2
+  assert terminal.fit("🦉owl", 4) == "🦉o…"
+  assert terminal.fit("e\u{301}x", 2) == "e\u{301}x"
+  let output = diff.render_with(
+    Some("🦉 owl\n界\n"),
+    "🦉 crow\n界\n",
+    View.Split,
+    100,
+    Mode.Plain
+  )
+  list.each(string.split(output, "\n"), fn(line: String) {
+    match string.starts_with(line, "  │") {
+      True -> assert terminal.cells(line) == 102
+      False -> Nil
+    }
+  })
+}
+
+test "snapshot controls are visible data instead of terminal instructions" {
+  assert terminal.safe("\u{1b}[2J") == "\\x1b[2J"
+  assert terminal.safe("a\t\r\n\u{0}") == "a⇥   ␍␊\\0"
+  assert terminal.safe("\u{202e}") == "\\u{202e}"
+  assert !string.contains(diff.render(None, "\u{1b}[2J", Mode.Plain), "\u{1b}")
+}
+
+test "split view falls back in narrow terminals and highlights changed characters" {
+  assert string.contains(
+    diff.render_with(Some("old"), "new", View.Split, 60, Mode.Plain),
+    " + new"
+  )
+  assert string.contains(
+    diff.render_with(
+      Some("port = 80\n"),
+      "port = 8080\n",
+      View.Split,
+      100,
+      Mode.Colour
+    ),
+    "48;2;"
+  )
+  assert string.contains(
+    diff.render(Some("port = 80\n"), "port = 8080\n", Mode.Colour),
+    "\u{1b}[32m"
+  )
+}
+
+test "snapshot: unified review card" {
+  let old = "host = localhost\nport = 80\ndebug = false\n"
+  let fresh = "host = localhost\nport = 8080\ndebug = false\n"
+  let output = review_ui.header(
+    "configuration",
+    "test/snapshots",
+    1,
+    3,
+    diff.compare(Some(old), fresh),
+    View.Unified,
+    76,
+    Mode.Plain
+  )
+    + diff.render_with(Some(old), fresh, View.Unified, 76, Mode.Plain)
+    + review_ui.actions(True, View.Unified, 76, Mode.Plain)
+  snapshot.snap(output, "review-unified")
+}
+
+test "snapshot: new candidate review" {
+  let fresh = "name = owl\nport = 8080\n"
+  let output = review_ui.header(
+    "configuration",
+    "test/snapshots",
+    2,
+    3,
+    diff.compare(None, fresh),
+    View.Unified,
+    76,
+    Mode.Plain
+  )
+    + diff.render(None, fresh, Mode.Plain)
+    + review_ui.actions(True, View.Unified, 76, Mode.Plain)
+  snapshot.snap(output, "review-new")
+}
+
+test "snapshot: new empty candidate and paused review summary" {
+  let output = review_ui.header(
+    "empty",
+    "test/snapshots",
+    3,
+    3,
+    diff.compare(None, ""),
+    View.Unified,
+    76,
+    Mode.Plain
+  )
+    + diff.render_with(None, "", View.Unified, 76, Mode.Plain)
+    + review_ui.feedback("· Skipped", "empty", Mode.Plain)
+    + review_ui.summary(Progress(1, 1, 1), 1, 76, Mode.Plain)
+  snapshot.snap(output, "review-paused")
+}
+
+test "diff colours are red and green while controls retain Pooka's palette" {
+  assert palette.diff_removed("old", Mode.Colour) == "\u{1b}[31mold\u{1b}[0m"
+  assert palette.diff_added("new", Mode.Colour) == "\u{1b}[32mnew\u{1b}[0m"
+  let coloured = diff.render(Some("old\n"), "new\n", Mode.Colour)
+  assert string.contains(coloured, "\u{1b}[31m")
+  assert string.contains(coloured, "\u{1b}[32m")
+  assert !string.contains(coloured, "48;2;")
+  assert string.contains(
+    review_ui.actions(True, View.Unified, 120, Mode.Colour),
+    "255;182;75"
+  )
+}
+
+test "review controls stay single column at every terminal width" {
+  let controls = review_ui.actions(True, View.Split, 120, Mode.Plain)
+  assert string.contains(controls, "a  accept")
+  assert string.contains(controls, "r  reject")
+  assert string.contains(controls, "d  hide diff")
+  assert !string.contains(controls, "split view")
+  assert !string.contains(controls, "[v]")
+}
+
+test "hiding the diff displays the complete neutral candidate" {
+  let content = "name = owl\nport = 8080\n"
+  let rendered = diff.render_candidate(content, 76, Mode.Colour)
+  assert string.contains(rendered, "name = owl")
+  assert string.contains(rendered, "port = 8080")
+  assert !string.contains(rendered, "\u{1b}[32m")
+  assert !string.contains(rendered, "\u{1b}[31m")
+}
+
+test "removed and added line numbers share one compact gutter" {
+  let before = list.range(1, 13) |> list.map(int.to_string) |> string.join("\n")
+  let after = string.replace(before, "\n9\n", "\nchanged\n")
+  let rendered = diff.render_with(
+    Some(before),
+    after,
+    View.Unified,
+    60,
+    Mode.Plain
+  )
+  assert string.contains(rendered, "    9 - 9\n")
+  assert string.contains(rendered, "    9 + changed\n")
+}
+
+test "wrapped graphemes retain every character and stay inside their display width" {
+  let source = generator.pair(
+    generator.strings(["a", " ", "界", "🦉", "e\u{301}"], 40),
+    generator.integers(2, 80)
+  )
+  property.for_all(source, fn(sample) {
+    let #(text, width) = sample
+    let rows = terminal.wrap(text, width)
+    assert string.join(rows, "") == text
+    assert list.all(rows, fn(row) { terminal.cells(row) <= width })
+  })
+  assert terminal.wrap("", 8) == [""]
+  assert terminal.wrap("abcdef", 3) == ["abc", "def"]
+}
+
+test "diff rows reflow without clipping and wide terminals have no fixed cap" {
+  let text = string.repeat("abcd", 50)
+  let narrow = diff.render_with(None, text, View.Unified, 24, Mode.Plain)
+  assert string.contains(narrow, " ↪ ")
+  assert !string.contains(narrow, "clipped")
+  list.each(string.split(narrow, "\n"), fn(row) {
+    assert terminal.cells(row) <= 26
+  })
+  let wide = diff.render_with(None, text, View.Unified, 240, Mode.Plain)
+  assert string.contains(wide, text)
+  assert !string.contains(wide, " ↪ ")
+}
+
+test "new candidates omit newline warnings while real newline changes remain explicit" {
+  assert !string.contains(diff.render(None, "first", Mode.Plain), "newline")
+  assert !string.contains(diff.render(None, "", Mode.Plain), "newline")
+  assert !string.contains(
+    diff.render_candidate("first", 76, Mode.Plain),
+    "newline"
+  )
+  let changed = diff.render(Some("first\n"), "first", Mode.Plain)
+  assert string.contains(changed, "Final newline: present → missing")
+  assert list.length(string.split(changed, "Final newline:")) == 2
+  assert !string.contains(changed, "New version")
+}

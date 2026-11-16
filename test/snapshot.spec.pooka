@@ -1,0 +1,207 @@
+// SPDX-License-Identifier: Apache-2.0
+
+module snapshot_test
+
+import poke/pretty
+import poke/should
+import poke/snapshot.{Store, Kind}
+import poke/diff
+import poke/palette.{Mode}
+import pooka/file
+import pooka/list
+import pooka/string
+
+// Every test owns a separate directory because pooka test runs them in parallel.
+_store(name: String) -> Store {
+  let directory = "build/poke-tests/" + name
+  _clean(directory)
+  let assert Ok(_) = file.create_directories(directory)
+  Store(directory)
+}
+
+_clean(path: String) -> Nil {
+  let assert Ok(exists) = file.exists(path)
+  match exists {
+    False -> Nil
+    True -> {
+      let assert Ok(directory) = file.is_directory(path)
+      match directory {
+        False -> {
+          let assert Ok(_) = file.delete(path)
+          Nil
+        }
+        True -> {
+          let assert Ok(entries) = file.list_directory(path)
+          list.each(entries, fn(name: String) { _clean(path + "/" + name) })
+          let assert Ok(_) = file.remove_directory(path)
+          Nil
+        }
+      }
+    }
+  }
+}
+
+test "first runs stage candidates without accepting them" {
+  let store = _store("first")
+  let problem = should.be_error(store.check("hello\n", "greeting"))
+  assert problem.kind == Kind.Missing
+  assert should.be_ok(file.read(store.directory + "/greeting.new")) == "hello\n"
+  assert should.be_ok(file.exists(store.directory + "/greeting.accepted")) == False
+  assert should.be_ok(store.pending()) == ["greeting"]
+}
+
+test "accepted matches pass and clear a stale candidate" {
+  let store = _store("matching")
+  let _ = should.be_error(store.check("owl", "bird"))
+  should.be_ok(store.accept("bird"))
+  should.be_ok(store.check("owl", "bird"))
+  assert should.be_ok(file.read(store.directory + "/bird.accepted")) == "owl"
+  let _ = should.be_error(store.check("crow", "bird"))
+  should.be_ok(store.check("owl", "bird"))
+  assert should.be_ok(store.pending()) == []
+}
+
+test "changed snapshots retain the accepted text until reviewed" {
+  let store = _store("changed")
+  let _ = should.be_error(store.check("owl\n", "bird"))
+  should.be_ok(store.accept("bird"))
+  let problem = should.be_error(store.check("crow\n", "bird"))
+  assert problem.kind == Kind.Changed
+  assert should.be_ok(file.read(store.directory + "/bird.accepted")) == "owl\n"
+  assert should.be_ok(file.read(store.directory + "/bird.new")) == "crow\n"
+  should.be_ok(store.accept("bird"))
+  should.be_ok(store.check("crow\n", "bird"))
+}
+
+test "reject removes only candidates and is harmless when repeated" {
+  let store = _store("reject")
+  let _ = should.be_error(store.check("old", "bird"))
+  should.be_ok(store.accept("bird"))
+  let _ = should.be_error(store.check("changed", "bird"))
+  should.be_ok(store.reject("bird"))
+  should.be_ok(store.reject("bird"))
+  assert should.be_ok(file.read(store.directory + "/bird.accepted")) == "old"
+  assert should.be_ok(store.pending()) == []
+}
+
+test "names cannot escape their configured directory" {
+  let store = _store("names")
+  list.each(
+    [
+      "",
+      "../escape",
+      "a/b",
+      "a\\b",
+      ".",
+      "two words",
+      "🦉",
+      string.repeat("x", 121)
+    ],
+    fn(name: String) {
+      let problem = should.be_error(store.check("text", name))
+      assert problem.kind == Kind.InvalidName
+      assert should.be_error(store.accept(name)).kind == Kind.InvalidName
+      assert should.be_error(store.reject(name)).kind == Kind.InvalidName
+    }
+  )
+  assert should.be_ok(store.pending()) == []
+  let _ = should.be_error(store.check("text", "Bird_12-test"))
+  assert should.be_ok(store.pending()) == ["Bird_12-test"]
+}
+
+test "pending names are sorted and unrelated files and directories are ignored" {
+  let store = _store("pending")
+  let _ = should.be_error(store.check("z", "zeta"))
+  let _ = should.be_error(store.check("a", "alpha"))
+  should.be_ok(file.write(store.directory + "/notes.txt", "leave me"))
+  should.be_ok(file.write(store.directory + "/bad name.new", "leave me too"))
+  should.be_ok(file.create_directory(store.directory + "/folder.new"))
+  assert should.be_ok(store.pending()) == ["alpha", "zeta"]
+  assert should.be_ok(Store(store.directory + "/missing").pending()) == []
+}
+
+test "empty text unicode and line endings are preserved exactly" {
+  let store = _store("exact")
+  let _ = should.be_error(store.check("", "empty"))
+  should.be_ok(store.accept("empty"))
+  should.be_ok(store.check("", "empty"))
+  let _ = should.be_error(store.check("🦉\r\n", "unicode"))
+  should.be_ok(store.accept("unicode"))
+  assert should.be_ok(file.read(store.directory + "/unicode.accepted")) == "🦉\r\n"
+  assert should.be_error(store.check("🦉\n", "unicode")).kind == Kind.Changed
+  assert should.be_error(store.check("\n", "empty")).kind == Kind.Changed
+}
+
+test "preview never accepts or modifies a candidate" {
+  let store = _store("preview")
+  let _ = should.be_error(store.check("hello\n", "greeting"))
+  let plain = should.be_ok(store.preview("greeting", Mode.Plain))
+  assert string.contains(plain, "+ hello")
+  assert !string.contains(plain, "\u{1b}")
+  assert should.be_ok(store.pending()) == ["greeting"]
+  assert should.be_ok(file.exists(store.directory + "/greeting.accepted")) == False
+}
+
+test "failed acceptance keeps its candidate and cleans temporary files" {
+  let store = _store("atomic-error")
+  should.be_ok(file.write(store.directory + "/blocked.new", "candidate"))
+  should.be_ok(file.create_directory(store.directory + "/blocked.accepted"))
+  assert should.be_error(store.accept("blocked")).kind == Kind.Io
+  assert should.be_ok(file.read(store.directory + "/blocked.new")) == "candidate"
+  assert should.be_ok(file.is_directory(store.directory + "/blocked.accepted"))
+  let entries = should.be_ok(file.list_directory(store.directory))
+  assert !list.any(entries, fn(name: String) { string.contains(name, ".tmp-") })
+}
+
+test "read and write failures are errors rather than snapshot mismatches" {
+  let store = _store("io-errors")
+  assert should.be_error(store.accept("absent")).kind == Kind.Io
+  should.be_ok(file.write(store.directory + "/not-a-directory", "keep me"))
+  let blocked = Store(store.directory + "/not-a-directory")
+  assert should.be_error(blocked.check("text", "bird")).kind == Kind.Io
+  assert should.be_ok(file.read(store.directory + "/not-a-directory")) == "keep me"
+}
+
+test "plain diffs show deletions additions context and trailing newlines" {
+  let rendered = diff.render(Some("a\nold\nz\n"), "a\nnew\nz\n", Mode.Plain)
+  assert string.contains(rendered, "┬")
+  assert string.contains(rendered, " 2 - old")
+  assert string.contains(rendered, " 2 + new")
+  assert diff.render(Some("same"), "same", Mode.Plain) == "No changes.\n"
+  assert !string.contains(diff.render(None, "owl", Mode.Plain), "final newline")
+  assert string.contains(
+    diff.render(Some("owl"), "owl\n", Mode.Plain),
+    "Final newline: missing → present"
+  )
+}
+
+test "colours follow Pooka's orange violet and green palette" {
+  assert palette.added("+ owl", Mode.Plain) == "+ owl"
+  assert palette.added("+ owl", Mode.Colour) == "\u{1b}[38;2;255;137;31m+ owl\u{1b}[0m"
+  assert palette.heading("Poke", Mode.Colour) == "\u{1b}[1;38;2;117;97;142mPoke\u{1b}[0m"
+  assert palette.success("✓", Mode.Colour) == "\u{1b}[38;2;97;175;111m✓\u{1b}[0m"
+  assert string.contains(diff.render(None, "owl\n", Mode.Colour), "\u{1b}[32m")
+}
+
+test "Poke snapshots its own plain review output" {
+  snapshot.snap(diff.render(None, "owl\n", Mode.Plain), "new-diff")
+}
+
+test "value snapshots use complete deterministic layouts without ANSI" {
+  let name = "built-in-pretty"
+  let root = "test/snapshots"
+  let accepted = root + "/" + name + ".accepted"
+  let content = pretty.format_with(
+    Ok([100, 200, 300]),
+    pretty.defaults().with_width(12)
+  )
+  // This accepted fixture is checked into the draft; tests never accept output.
+  should.equal(should.be_ok(file.read(accepted)), content)
+  snapshot.value_with(
+    Ok([100, 200, 300]),
+    name,
+    pretty.defaults().with_width(12).with_max_items(1).with_max_depth(
+      1
+    )
+  )
+}

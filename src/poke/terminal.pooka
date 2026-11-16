@@ -1,0 +1,50 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Keep the frame steady when a line contains an owl, an accent or a long path.
+//// Terminal controls in snapshot text are made visible before rendering; they
+//// remain unchanged in the actual snapshot. Clipping never splits a grapheme.
+module terminal
+
+import pooka/int
+
+external _Bridge from erlang "poke_ffi" {
+  columns() -> Int
+
+  wrap(text: String, width: Int) -> List(String)
+
+  fit(text: String, width: Int) -> String
+
+  cells(text: String) -> Int
+
+  visible(text: String) -> String
+}
+
+columns() -> Int {
+  int.max(16, _Bridge.columns() - 2)
+}
+
+fit(text: String, width: Int) -> String {
+  _Bridge.fit(text, width)
+}
+
+cells(text: String) -> Int {
+  _Bridge.cells(text)
+}
+
+safe(text: String) -> String {
+  _Bridge.visible(text)
+}
+
+/// Clip only when necessary, preserving the text's own trailing whitespace.
+clip(text: String, width: Int) -> String {
+  match cells(text) > width {
+    True -> fit(text, width)
+    False -> text
+  }
+}
+
+/// Wrap without losing text or splitting a grapheme. Width is measured in
+/// display cells; a wide character remains whole at a continuation boundary.
+wrap(text: String, width: Int) -> List(String) {
+  _Bridge.wrap(text, width)
+}

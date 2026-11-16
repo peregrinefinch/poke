@@ -1,0 +1,199 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// A smaller command sequence must still describe a possible world.
+module model_test
+
+import poke/should
+import poke/model
+import poke/generator.{Sample}
+import poke/property
+import poke/process
+import pooka/list
+
+external Probe from erlang "poke_probe" {
+  self_pid() -> Pid
+}
+
+class Command {}
+
+class Push(value: Int) is Command
+
+class Pop is Command {}
+
+class StackModel with model.Commands(Int, Command, Int) {
+  initial() -> Int {
+    0
+  }
+
+  generate(state: Int, seed: Int, size: Int) -> Sample(Option(Command)) {
+    let next = generator.next_seed(seed)
+    let command = match state > 0 && next % 2 == 0 {
+      True -> Pop()
+      False -> Push(next % 10)
+    }
+    Sample(Some(command), next)
+  }
+
+  valid(state: Int, command: Command) -> Bool {
+    match command {
+      Push(_) -> True
+      Pop() -> state > 0
+    }
+  }
+
+  predict(state: Int, command: Command) -> #(Int, Int) {
+    let next = match command {
+      Push(_) -> state + 1
+      Pop() -> state - 1
+    }
+    #(next, next)
+  }
+
+  shrink(command: Command) -> List(Command) {
+    match command {
+      Push(n) if n != 0 -> [Push(0)]
+      _ -> []
+    }
+  }
+}
+
+_valid(commands: List(Command), state: Int) -> Bool {
+  match commands {
+    [] -> True
+    [command, ..rest] -> {
+      let machine = StackModel()
+      match machine.valid(state, command) {
+        False -> False
+        True -> {
+          let #(next, _) = machine.predict(state, command)
+          _valid(rest, next)
+        }
+      }
+    }
+  }
+}
+
+test "stateful generation respects the evolving preconditions" {
+  let source = model.commands(StackModel(), 30)
+  list.each(list.range(1, 100), fn(seed) {
+    let values = source.sample(seed, 30).value
+    should.be_true(_valid(values, 0))
+    should.be_true(list.length(values) <= 30)
+    list.each(source.shrink(values), fn(smaller) {
+      should.be_true(_valid(smaller, 0))
+    })
+  })
+  should.equal(model.commands(StackModel(), 0).sample(42, 10).value, [])
+  should.attempt(fn() { model.commands(StackModel(), -1) }) |> should.be_error()
+}
+
+test "model-aware shrinking removes sequences with invalid later commands" {
+  let source = model.commands(StackModel(), 10)
+  let smaller = source.shrink([Push(5), Pop()])
+  should.be_true(list.contains(smaller, []))
+  should.be_false(list.contains(smaller, [Pop()]))
+  should.be_true(list.contains(smaller, [Push(0), Pop()]))
+}
+
+test "invalid hand-written command sequences do not touch real state" {
+  let messages = process.channel()
+  should.attempt(fn() {
+    let invalid: List(Command) = [Pop()]
+    model.check_commands(invalid, StackModel(), fn(_) {
+      messages.send("effect")
+      0
+    })
+  }) |> should.be_error()
+  should.be_error(messages.receive(0))
+}
+
+class Finished with model.Commands(Int, Int, Int) {
+  initial() -> Int {
+    0
+  }
+
+  generate(state: Int, seed: Int, size: Int) -> Sample(Option(Int)) {
+    Sample(None, seed)
+  }
+
+  valid(state: Int, command: Int) -> Bool {
+    False
+  }
+
+  predict(state: Int, command: Int) -> #(Int, Int) {
+    #(state, command)
+  }
+
+  shrink(command: Int) -> List(Int) {
+    []
+  }
+}
+
+test "a model with no next command ends generation without retries" {
+  should.equal(model.commands(Finished(), 10).sample(1, 10).value, [])
+}
+
+actor Depth {
+  var count: Int
+
+  new() {
+    self.count = 0
+  }
+
+  pid() -> Pid {
+    Probe.self_pid()
+  }
+
+  perform(command: Command) -> Int {
+    match command {
+      Push(_) -> count += 1
+      Pop() -> count -= 1
+    }
+    count
+  }
+}
+
+test "generated stateful commands compare real actor replies with their model" {
+  let machine = StackModel()
+  property.for_all(model.commands(machine, 20), fn(commands) {
+    let real = Depth()
+    let _ = process.with_process(real.pid(), fn(_) {
+      model.check_commands(commands, machine, fn(command) {
+        real.perform(command)
+      })
+    })
+    Nil
+  })
+}
+
+class InvalidModel with model.Commands(Int, Command, Int) {
+  initial() -> Int {
+    0
+  }
+
+  generate(state: Int, seed: Int, size: Int) -> Sample(Option(Command)) {
+    let command: Command = Pop()
+    Sample(Some(command), seed)
+  }
+
+  valid(state: Int, command: Command) -> Bool {
+    False
+  }
+
+  predict(state: Int, command: Command) -> #(Int, Int) {
+    panic as "invalid command advanced the model"
+  }
+
+  shrink(command: Command) -> List(Command) {
+    []
+  }
+}
+
+test "a generator violating its precondition is rejected before prediction" {
+  let seed = list.find(list.range(1, 100), fn(seed) {
+    generator.integers(0, 10).sample(seed, 10).value > 0
+  }) |> should.be_some()
+  should.attempt(fn() { model.commands(InvalidModel(), 10).sample(seed, 10) })
+  |> should.be_error()
+  |> should.contain_text("precondition is false")
+}

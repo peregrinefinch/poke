@@ -1,0 +1,156 @@
+// SPDX-License-Identifier: Apache-2.0
+
+module pretty_test
+
+import pooka/dict
+import pooka/set
+import poke/pretty
+
+class Owl(name: String, age: Int, friends: List(String))
+
+class Shape {}
+
+class Circle(radius: Float) is Shape
+
+class Square(side: Float) is Shape
+
+class Point(x: Int, y: Int)
+
+class Pixel is Point {
+  let colour: String
+
+  new(x: Int, y: Int, colour: String) {
+    super.new(x, y)
+    self.colour = colour
+  }
+}
+
+class Line(from: Point, to: Point)
+
+class Empty {}
+
+class Lantern {
+  let room: String
+  let lit: Bool
+
+  new(room: String) {
+    self.room = room
+    self.lit = False
+  }
+}
+
+enum Weather {
+  Sunny,
+  Rainy
+}
+
+actor Kettle {
+  var cups: Int = 0
+
+  poured() -> Int {
+    cups
+  }
+}
+
+_narrow(width: Int) -> pretty.Options {
+  pretty.defaults().with_width(width)
+}
+
+test "small things" {
+  assert pretty.format(42) == "42"
+  assert pretty.format(-2.5) == "-2.5"
+  assert pretty.format(True) == "True"
+  assert pretty.format(Nil) == "Nil"
+  assert pretty.format("owl") == "\"owl\""
+  assert pretty.format("a \"quoted\"\nline") == "\"a \\\"quoted\\\"\\nline\""
+  assert pretty.format("é🦉") == "\"é🦉\""
+}
+
+test "options and results" {
+  assert pretty.format(Some(1)) == "Some(1)"
+  let nothing: Option(Int) = None
+  assert pretty.format(nothing) == "None"
+  let fine: Result(Int, String) = Ok(1)
+  assert pretty.format(fine) == "Ok(1)"
+  let broken: Result(Int, String) = Error("no")
+  assert pretty.format(broken) == "Error(\"no\")"
+}
+
+test "lists, tuples and bit arrays" {
+  assert pretty.format([1, 2, 3]) == "[1, 2, 3]"
+  let empty: List(Int) = []
+  assert pretty.format(empty) == "[]"
+  assert pretty.format(#(1, "a", Nil)) == "#(1, \"a\", Nil)"
+  assert pretty.format(<<1, 2, 255>>) == "<<1, 2, 255>>"
+}
+
+test "objects look like their constructors" {
+  assert pretty.format(Owl("Ada", 3, ["Fig"])) == "Owl(\"Ada\", 3, [\"Fig\"])"
+  assert pretty.format(Empty()) == "Empty()"
+  assert pretty.format(Point(1, 2)) == "Point(1, 2)"
+}
+
+test "a subclass shows its own name and every field" {
+  let shape: Shape = Circle(2.5)
+  assert pretty.format(shape) == "Circle(2.5)"
+  assert pretty.format([Circle(1.0), Square(2.0)]) == "[Circle(1.0), Square(2.0)]"
+  assert pretty.format(Pixel(1, 2, "red")) == "Pixel(1, 2, \"red\")"
+}
+
+test "an object as the last field is a field" {
+  assert pretty.format(Line(Point(0, 0), Point(3, 4))) == "Line(Point(0, 0), Point(3, 4))"
+}
+
+test "a class with its own constructor shows its fields" {
+  assert pretty.format(Lantern("attic")) == "Lantern(\"attic\", False)"
+}
+
+test "enums, functions and actors" {
+  assert pretty.format(Weather.Rainy) == "Weather.Rainy"
+  assert pretty.format(fn(a: Int, b: Int) { a + b }) == "fn(_, _) { ... }"
+  let kettle = pretty.format(Kettle())
+  assert pretty.format(kettle) != ""
+}
+
+test "dicts and sets are shown as the code that builds them" {
+  assert pretty.format(dict.from_list([#("b", 2), #("a", 1)])) == "dict.from_list([#(\"a\", 1), #(\"b\", 2)])"
+  assert pretty.format(set.from_list([3, 1, 2])) == "set.from_list([1, 2, 3])"
+}
+
+test "a value that does not fit is broken over lines" {
+  assert pretty.format_with([100, 200, 300], _narrow(8)) == "[\n  100,\n  200,\n  300\n]"
+  assert pretty.format_with([100, 200, 300], _narrow(15)) == "[100, 200, 300]"
+}
+
+test "only the groups that do not fit are broken" {
+  let owl = Owl("Ada", 3, ["Bramble", "Fig", "Thistle"])
+  assert pretty.format_with(owl, _narrow(40)) == "Owl(\n  \"Ada\",\n  3,\n  [\"Bramble\", \"Fig\", \"Thistle\"]\n)"
+  assert pretty.format_with(owl, _narrow(20)) == "Owl(\n  \"Ada\",\n  3,\n  [\n    \"Bramble\",\n    \"Fig\",\n    \"Thistle\"\n  ]\n)"
+}
+
+test "the indent can be changed" {
+  let options = _narrow(5).with_indent(4)
+  assert pretty.format_with([10, 20], options) == "[\n    10,\n    20\n]"
+}
+
+test "long collections can be cut short" {
+  let options = pretty.defaults().with_max_items(3)
+  assert pretty.format_with([1, 2, 3, 4, 5], options) == "[1, 2, 3, ... 2 more]"
+  assert pretty.format_with([1, 2, 3], options) == "[1, 2, 3]"
+}
+
+test "deep values can be cut short" {
+  let options = pretty.defaults().with_max_depth(2)
+  assert pretty.format_with([[[1], [2]]], options) == "[[..., ...]]"
+  assert pretty.format_with(Some([1]), options) == "Some([...])"
+}
+
+test "pretty output is plain for both narrow and wide layouts" {
+  assert pretty.format_with([100, 200, 300], _narrow(15)) == "[100, 200, 300]"
+  assert pretty.format_with([100, 200, 300], _narrow(8)) == "[\n  100,\n  200,\n  300\n]"
+  assert pretty.format(True) == "True"
+}
+
+test "print hands the value back" {
+  assert pretty.print_with([1, 2], pretty.defaults()) == [1, 2]
+}

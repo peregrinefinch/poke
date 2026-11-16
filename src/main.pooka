@@ -1,0 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//// Poke keeps test declarations with Pooka and snapshot review close at hand.
+//// Run `pooka run -- review` in this draft, or `pooka run -m poke review`
+//// from a project that depends on it. Tests never accept their own candidates.
+module main
+
+import poke/cli
+
+main() {
+  cli.main()
+}
