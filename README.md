@@ -9,7 +9,11 @@ Poke your code to find bugs!
 Assertions, properties, regressions, snapshots, fixtures, state models and
 process tests for Pooka.
 
+Put this in `test/main.spec.pooka`:
+
 ```pooka
+module main_test
+
 import poke/should
 
 test "a small sum" {
