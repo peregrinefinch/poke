@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.0
 
 - Use stdlib 0.4.1 output functions and preserve write errors in snapshot review.
 

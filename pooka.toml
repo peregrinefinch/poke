@@ -1,5 +1,5 @@
 name = "poke"
-version = "1.0.0"
+version = "1.1.0"
 description = "Poke your code to find bugs!"
 authors = ["Peregrine Finch"]
 licences = ["Apache-2.0"]
