@@ -2,13 +2,13 @@
 version = 1
 
 [requirements]
-pooka_stdlib = ">= 0.3.1 and < 1.0.0"
+pooka_stdlib = ">= 0.4.1 and < 1.0.0"
 
 [dev-requirements]
 
 [[packages]]
 name = "pooka_stdlib"
-version = "0.3.1"
-checksum = "07d145f8f3c5fc52c50b1ec01476229f203507ea24c22a0c20e0754256a554fe"
+version = "0.4.1"
+checksum = "a8f4a922ed20336ec6e6a146759f42b6133cded43cc53b3893baf016a74e63c7"
 dependencies = []
 requirements = {  }

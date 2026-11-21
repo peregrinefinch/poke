@@ -315,7 +315,7 @@ extensions are involved: assertions raise the native comparison/failure terms.
 
 ```pooka
 let found = capture.output(fn() {
-  should.be_ok(io.println("hello"))
+  io.println("hello")
   42
 })
 should.equal(found.value, 42)

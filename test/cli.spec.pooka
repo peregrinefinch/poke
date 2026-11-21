@@ -189,7 +189,7 @@ test "Enter refreshes the same candidate using the current terminal width" {
         ["wide"],
         Mode.Plain,
         terminal.read,
-        fn(text) { io.print(text) |> pooka_error() },
+        fn(text) { io.try_print(text) |> pooka_error() },
         terminal.columns
       )
     })

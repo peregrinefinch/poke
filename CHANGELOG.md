@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Use stdlib 0.4.1 output functions and preserve write errors in snapshot review.
+
 ## 1.0.0
 
 - Initial release of `poke`.

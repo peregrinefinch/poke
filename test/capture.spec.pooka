@@ -26,7 +26,7 @@ external Probe from erlang "poke_probe" {
 test "output capture retains values Unicode and line endings" {
   let original = Probe.current_leader()
   let captured = capture.output(fn() {
-    should.be_ok(io.println("hello 🦉"))
+    io.println("hello 🦉")
     42
   })
   should.equal(captured.value, 42)
@@ -36,10 +36,10 @@ test "output capture retains values Unicode and line endings" {
 
 test "nested captures have separate output and restore their parent" {
   let outer = capture.output(fn() {
-    should.be_ok(io.println("before"))
-    let inner = capture.output(fn() { should.be_ok(io.println("inside")) })
+    io.println("before")
+    let inner = capture.output(fn() { io.println("inside") })
     should.equal(inner.text, "inside\n")
-    should.be_ok(io.println("after"))
+    io.println("after")
   })
   should.equal(outer.text, "before\nafter\n")
 }
@@ -47,7 +47,7 @@ test "nested captures have separate output and restore their parent" {
 test "failed captures retain text and restore the original group leader" {
   let original = Probe.current_leader()
   let captured = capture.attempt(fn() {
-    should.be_ok(io.println("before failure"))
+    io.println("before failure")
     should.equal(1, 2)
   })
   should.equal(captured.text, "before failure\n")
@@ -67,14 +67,14 @@ test "the output collector is joined before a capture returns" {
 test "capture handles compound requests and recovers from invalid requests" {
   let captured = capture.output(fn() {
     Probe.io_requests()
-    should.be_ok(io.println("three"))
+    io.println("three")
   })
   should.equal(captured.text, "onetwothree\n")
 }
 
 test "children share capture while joined inside its scope" {
   let captured = capture.output(fn() {
-    process.within(1000, fn() { should.be_ok(io.println("from a child")) }) |> should.be_ok()
+    process.within(1000, fn() { io.println("from a child") }) |> should.be_ok()
   })
   should.equal(captured.text, "from a child\n")
 }
@@ -98,7 +98,7 @@ test "nested capture failure restores the outer collector" {
       (broken.value |> should.be_error()).kind,
       failure.Kind.Exception
     )
-    should.be_ok(io.println("outer still works"))
+    io.println("outer still works")
   })
   should.equal(found.text, "outer still works\n")
 }

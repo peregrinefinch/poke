@@ -394,7 +394,7 @@ run(options: Options) -> Result(Nil, String) {
 }
 
 _tell(text: String) -> Result(Nil, String) {
-  io.print(text) |> result.map_error(fn(problem: io.IoError) {
+  io.try_print(text) |> result.map_error(fn(problem: io.IoError) {
     problem.message
   })
 }
@@ -413,7 +413,7 @@ main() {
   match outcome {
     Ok(_) -> Nil
     Error(message) -> {
-      let _ = io.eprintln("poke: " + message)
+      io.eprintln("poke: " + message)
       _Bridge.halt(1)
     }
   }
